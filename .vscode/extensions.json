@@ -1,0 +1,8 @@
+{
+    "recommendations": [
+        "golang.go",
+        "Vue.volar",
+        "EditorConfig.EditorConfig",
+        "esbenp.prettier-vscode"
+    ]
+}
