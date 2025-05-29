@@ -29,5 +29,6 @@
     },
     "files.exclude": {
         "**/.git": false
-    }
+    },
+    "css.lint.unknownAtRules": "ignore"
 }
