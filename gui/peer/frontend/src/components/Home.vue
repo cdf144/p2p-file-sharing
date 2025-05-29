@@ -1,8 +1,10 @@
 <script lang="ts" setup>
-import { reactive, onMounted, onUnmounted } from 'vue';
+import { reactive, onMounted, onUnmounted, computed, ref } from 'vue';
 import { StartPeerLogic, SelectShareDirectory } from '../../wailsjs/go/main/App';
 import { EventsOn } from '../../wailsjs/runtime/runtime';
 import { protocol } from '../../wailsjs/go/models';
+
+const MAX_VISIBLE_PAGE_BUTTONS = 5;
 
 const peerConfig = reactive({
     indexURL: 'http://localhost:9090',
@@ -16,6 +18,48 @@ const peerState = reactive({
     sharedFiles: [] as protocol.FileMeta[],
     isServing: false,
     isLoading: false,
+});
+
+const sharedFilesPerPage = ref(10);
+const currentPage = ref(1);
+
+const sharedFilesTotalPages = computed(() => {
+    return Math.ceil(peerState.sharedFiles.length / sharedFilesPerPage.value);
+});
+
+const sharedFilesPaginated = computed(() => {
+    const start = (currentPage.value - 1) * sharedFilesPerPage.value;
+    const end = currentPage.value * sharedFilesPerPage.value;
+    return peerState.sharedFiles.slice(start, end);
+});
+
+const visiblePages = computed(() => {
+    const total = sharedFilesTotalPages.value;
+    const current = currentPage.value;
+    if (total <= MAX_VISIBLE_PAGE_BUTTONS) {
+        return Array.from({ length: total }, (_, i) => i + 1);
+    }
+
+    const half = Math.floor(MAX_VISIBLE_PAGE_BUTTONS / 2);
+    let start = current - half;
+    let end = current + half;
+    if (start < 1) {
+        start = 1;
+        end = MAX_VISIBLE_PAGE_BUTTONS;
+    }
+    if (end > total) {
+        end = total;
+        start = total - MAX_VISIBLE_PAGE_BUTTONS + 1;
+    }
+
+    return Array.from({ length: end - start + 1 }, (_, i) => start + i);
+});
+
+const showLeftEllipsis = computed(() => {
+    return visiblePages.value[0] > 1;
+});
+const showRightEllipsis = computed(() => {
+    return visiblePages.value[visiblePages.value.length - 1] < sharedFilesTotalPages.value;
 });
 
 async function selectDirectory() {
@@ -84,9 +128,28 @@ onUnmounted(() => {
 function formatFileSize(bytes: number): string {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const sizes = ['Bytes', 'KiB', 'MiB', 'GiB', 'TiB'];
+    // Logarithm base change rule: log_k(bytes) = ln(bytes) / ln(k)
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function goToPage(page: number) {
+    if (page >= 1 && page <= sharedFilesTotalPages.value) {
+        currentPage.value = page;
+    }
+}
+
+function prevPage() {
+    if (currentPage.value > 1) {
+        currentPage.value--;
+    }
+}
+
+function nextPage() {
+    if (currentPage.value < sharedFilesTotalPages.value) {
+        currentPage.value++;
+    }
 }
 </script>
 
@@ -94,7 +157,7 @@ function formatFileSize(bytes: number): string {
     <main class="container mx-auto space-y-6 p-4">
         <h1 class="text-center text-2xl font-bold">P2P File Sharing Peer</h1>
 
-        <div class="config-form space-y-4 rounded-lg bg-gray-700 p-6 shadow-lg">
+        <div class="space-y-4 rounded-lg bg-gray-700 p-6 shadow-lg">
             <h2 class="text-xl font-semibold">Peer Configuration</h2>
             <div>
                 <label for="indexURL" class="block text-sm font-medium text-gray-300"
@@ -177,21 +240,38 @@ function formatFileSize(bytes: number): string {
             </button>
         </div>
 
-        <div class="status-display rounded-lg bg-gray-700 p-4 shadow">
+        <div class="rounded-lg bg-gray-700 p-4 shadow">
             <h3 class="font-semibold">Status:</h3>
             <p class="break-all text-gray-300">{{ peerState.statusMessage }}</p>
-            <p v.if="peerState.isServing" class="font-semibold text-green-400">
-                Peer is currently active.
+            <p v-if="peerState.isServing" class="text-green-400">
+                Peer is serving files from: {{ peerConfig.shareDir || 'not set' }}
             </p>
         </div>
 
         <div
-            class="shared-files rounded-lg bg-gray-700 p-4 shadow"
+            class="rounded-lg bg-gray-700 p-4 shadow"
             v-if="peerConfig.shareDir && peerState.sharedFiles.length > 0"
         >
-            <h3 class="mb-2 text-lg font-semibold">
-                Shared Files (from: {{ peerConfig.shareDir }})
-            </h3>
+            <div class="mb-4 flex items-center justify-between">
+                <h3 class="text-lg font-semibold">
+                    Shared Files (from: {{ peerConfig.shareDir }})
+                </h3>
+
+                <div class="flex items-center space-x-2">
+                    <label for="filesPerPage" class="text-sm text-gray-300">Files per page:</label>
+                    <select
+                        id="filesPerPage"
+                        v-model.number="sharedFilesPerPage"
+                        @change="currentPage = 1"
+                        class="appearance-none rounded border border-gray-500 bg-gray-600 px-2 py-1 text-sm text-white hover:border-indigo-500 focus:ring-1 focus:ring-indigo-500 focus:outline-none"
+                    >
+                        <option v-for="option in [5, 10, 20, 50]">
+                            {{ option }}
+                        </option>
+                    </select>
+                </div>
+            </div>
+
             <div class="overflow-x-auto">
                 <table class="min-w-full divide-y divide-gray-600">
                     <thead class="bg-gray-600">
@@ -217,39 +297,92 @@ function formatFileSize(bytes: number): string {
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-600 bg-gray-700">
-                        <tr v-for="file in peerState.sharedFiles" :key="file.Checksum">
+                        <tr v-for="file in sharedFilesPaginated" :key="file.Checksum">
                             <td
-                                class="px-6 py-4 text-sm font-medium whitespace-nowrap text-gray-200"
+                                class="px-6 py-4 text-left text-sm font-medium whitespace-nowrap text-gray-200"
                             >
                                 {{ file.Name }}
                             </td>
-                            <td class="px-6 py-4 text-sm whitespace-nowrap text-gray-300">
+                            <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
                                 {{ formatFileSize(file.Size) }}
                             </td>
                             <td
-                                class="truncate px-6 py-4 text-sm whitespace-nowrap text-gray-300"
+                                class="truncate px-6 py-4 text-left text-sm text-gray-300"
                                 :title="file.Checksum"
                             >
-                                {{ file.Checksum.substring(0, 32) }}...
+                                {{ file.Checksum }}
                             </td>
                         </tr>
                     </tbody>
                 </table>
             </div>
+
+            <div class="mt-4 flex items-center justify-between" v-if="sharedFilesTotalPages > 1">
+                <div class="text-sm text-gray-300">
+                    Showing {{ (currentPage - 1) * sharedFilesPerPage + 1 }} to
+                    {{ Math.min(currentPage * sharedFilesPerPage, peerState.sharedFiles.length) }}
+                    of {{ peerState.sharedFiles.length }} files
+                </div>
+
+                <div class="flex items-center space-x-2">
+                    <button
+                        @click="prevPage"
+                        :disabled="currentPage === 1"
+                        class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        Previous
+                    </button>
+
+                    <div class="flex space-x-1">
+                        <button
+                            v-if="showLeftEllipsis"
+                            @click="goToPage(1)"
+                            class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500"
+                        >
+                            1
+                        </button>
+
+                        <span v-if="showLeftEllipsis" class="px-2 text-gray-400">...</span>
+
+                        <button
+                            v-for="page in visiblePages"
+                            :key="page"
+                            @click="goToPage(page)"
+                            :class="[
+                                'rounded px-3 py-1 text-sm',
+                                currentPage === page
+                                    ? 'bg-blue-600 text-white'
+                                    : 'bg-gray-600 hover:bg-gray-500',
+                            ]"
+                        >
+                            {{ page }}
+                        </button>
+
+                        <span v-if="showRightEllipsis" class="px-2 text-gray-400">...</span>
+
+                        <button
+                            v-if="showRightEllipsis"
+                            @click="goToPage(sharedFilesTotalPages)"
+                            class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500"
+                        >
+                            {{ sharedFilesTotalPages }}
+                        </button>
+                    </div>
+
+                    <button
+                        @click="nextPage"
+                        :disabled="currentPage === sharedFilesTotalPages"
+                        class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        Next
+                    </button>
+                </div>
+            </div>
         </div>
-        <div class="shared-files rounded-lg bg-gray-700 p-4 shadow" v-else-if="peerConfig.shareDir">
-            <p class="text-gray-400">
+        <div class="rounded-lg bg-gray-700 p-4 shadow" v-else-if="peerConfig.shareDir">
+            <p class="text-red-400">
                 No files found in '{{ peerConfig.shareDir }}' or directory not yet scanned.
             </p>
         </div>
     </main>
 </template>
-
-<style scoped>
-.truncate {
-    max-width: 200px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-</style>
