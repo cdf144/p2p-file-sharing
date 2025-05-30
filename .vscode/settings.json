@@ -1,10 +1,11 @@
 {
     "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.fixAll": "explicit",
+        "source.organizeImports": "explicit"
+    },
     "[go]": {
-        "editor.defaultFormatter": "golang.go",
-        "editor.codeActionsOnSave": {
-            "source.organizeImports": "explicit"
-        }
+        "editor.defaultFormatter": "golang.go"
     },
     "[typescript]": {
         "editor.defaultFormatter": "esbenp.prettier-vscode"
