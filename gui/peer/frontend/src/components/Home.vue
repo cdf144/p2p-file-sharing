@@ -1,8 +1,8 @@
 <script lang="ts" setup>
-import { reactive, onMounted, onUnmounted, computed, ref } from 'vue';
-import { StartPeerLogic, SelectShareDirectory } from '../../wailsjs/go/main/App';
-import { EventsOn } from '../../wailsjs/runtime/runtime';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { SelectShareDirectory, StartPeerLogic } from '../../wailsjs/go/main/App';
 import { protocol } from '../../wailsjs/go/models';
+import { EventsOn } from '../../wailsjs/runtime/runtime';
 
 const MAX_VISIBLE_PAGE_BUTTONS = 5;
 
@@ -64,13 +64,14 @@ const showRightEllipsis = computed(() => {
 
 async function selectDirectory() {
     try {
+        peerConfig.shareDir = '';
+        peerState.statusMessage = 'Selected directory. Scanning for files...';
         const selectedDir = await SelectShareDirectory();
         if (selectedDir) {
             peerConfig.shareDir = selectedDir;
             peerState.statusMessage = `Selected directory: ${selectedDir}. Scan results will appear below if files are found.`;
         }
     } catch (error) {
-        console.error('Error selecting directory:', error);
         peerState.statusMessage = `Error selecting directory: ${error}`;
     }
 }
@@ -105,17 +106,8 @@ let unsubscribeFilesScanned: (() => void) | undefined;
 
 onMounted(() => {
     unsubscribeFilesScanned = EventsOn('filesScanned', (files: protocol.FileMeta[] | null) => {
-        if (files) {
-            peerState.sharedFiles = files;
-            peerState.statusMessage = `Scanned ${files.length} files from ${
-                peerConfig.shareDir || 'selected directory'
-            }.`;
-        } else {
-            peerState.sharedFiles = [];
-            peerState.statusMessage = `No files found or error scanning ${
-                peerConfig.shareDir || 'selected directory'
-            }.`;
-        }
+        peerState.sharedFiles = files || [];
+        currentPage.value = 1;
     });
 });
 

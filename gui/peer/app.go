@@ -93,7 +93,7 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 		return "Peer is already running", nil
 	}
 
-	var files []protocol.FileMeta
+	files := []protocol.FileMeta{}
 	if shareDir == "" {
 		wruntime.LogInfof(a.ctx, "[peer] No share directory specified. No files will be shared.")
 	} else {
@@ -103,21 +103,28 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 			return "", fmt.Errorf("failed to get absolute path for share directory %s: %w", shareDir, err)
 		}
 		shareDir = absShareDir
-		a.currentShareDir = shareDir
 
-		files, err = a.scanDirectoryInternal(shareDir)
-		if err != nil {
-			wruntime.LogWarningf(
+		if a.currentShareDir == absShareDir {
+			files = a.sharedFiles
+			wruntime.LogInfof(
 				a.ctx,
-				"[peer] Failed to scan share directory %s: %v. No files will be shared.",
+				"[peer] Files already scanned in share directory %s. Reusing %d files.",
 				shareDir,
-				err,
+				len(files),
 			)
-			files = []protocol.FileMeta{}
+		} else {
+			files, err = a.scanDirectoryInternal(shareDir)
+			if err != nil {
+				wruntime.LogWarningf(
+					a.ctx,
+					"[peer] Failed to scan share directory %s: %v. No files will be shared.",
+					shareDir,
+					err,
+				)
+			}
+			a.sharedFiles = files
+			wruntime.EventsEmit(a.ctx, "filesScanned", files)
 		}
-
-		a.sharedFiles = files
-		wruntime.EventsEmit(a.ctx, "filesScanned", files)
 	}
 
 	ipAddr, err := a.getMachineIPInternal()
