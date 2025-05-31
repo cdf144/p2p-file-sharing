@@ -34,7 +34,8 @@ func main() {
 
 	http.HandleFunc("/announce", indexServer.handleAnnounce)
 	http.HandleFunc("/search", indexServer.handleSearch)
-	http.HandleFunc("/peers", indexServer.handlePeers)
+	http.HandleFunc("/peers", indexServer.handleAllPeers)
+	http.HandleFunc("/peers/{checksum}", indexServer.handleOnePeers)
 
 	log.Printf("[index-server] Starting server on %s", httpServer.Addr)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -84,8 +85,32 @@ func (s *IndexServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *IndexServer) handlePeers(w http.ResponseWriter, r *http.Request) {
-	checksum := r.URL.Query().Get("checksum")
+func (s *IndexServer) handleAllPeers(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	peerMap := make(map[string]protocol.PeerInfo)
+	for _, peers := range s.files {
+		for _, peer := range peers {
+			key := fmt.Sprintf("%s:%d", peer.IP.String(), peer.Port)
+			peerMap[key] = peer
+		}
+	}
+
+	var allPeers []protocol.PeerInfo
+	for _, peer := range peerMap {
+		allPeers = append(allPeers, peer)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(allPeers); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		log.Printf("[index-server] Failed to encode response: %v\n", err)
+	}
+}
+
+func (s *IndexServer) handleOnePeers(w http.ResponseWriter, r *http.Request) {
+	checksum := r.PathValue("checksum")
 	if checksum == "" {
 		http.Error(w, "missing checksum query parameter", http.StatusBadRequest)
 		return

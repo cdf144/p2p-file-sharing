@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +32,12 @@ type App struct {
 	announcedIP     net.IP
 	announcedPort   uint16
 	servePort       uint16
+}
+
+type FileInfo struct {
+	Checksum string
+	Path     string
+	Name     string
 }
 
 // NewApp creates a new App application struct
@@ -196,6 +207,152 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 	return successMsg, nil
 }
 
+func (a *App) QueryIndexServer(indexURL string) ([]protocol.PeerInfo, error) {
+	queryURL := indexURL + "/peers"
+	req, err := http.NewRequestWithContext(a.ctx, "GET", queryURL, nil)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to create query request to %s: %v", queryURL, err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to send query request to %s: %v", queryURL, err)
+		return nil, fmt.Errorf("request to index server failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("server returned status %s: %s", resp.Status, string(respBody))
+		wruntime.LogErrorf(a.ctx, "[peer] Query failed: %s", errMsg)
+		return nil, fmt.Errorf("%s", errMsg)
+	}
+
+	var peers []protocol.PeerInfo
+	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to decode response from index server: %v", err)
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	wruntime.LogInfof(a.ctx, "[peer] Successfully queried index server: found %d peers", len(peers))
+	return peers, nil
+}
+
+func (a *App) DownloadFileWithDialog(
+	peerIP string,
+	peerPort uint16,
+	fileChecksum, fileName string,
+) (string, error) {
+	saveDir, err := wruntime.SaveFileDialog(a.ctx, wruntime.SaveDialogOptions{
+		Title:           "Save Downloaded File",
+		DefaultFilename: fileName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to choose save location: %w", err)
+	}
+
+	if saveDir == "" {
+		return "", fmt.Errorf("save cancelled by user")
+	}
+
+	err = a.DownloadFile(peerIP, peerPort, fileChecksum, fileName, saveDir)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("Successfully downloaded %s to %s", fileName, saveDir), nil
+}
+
+func (a *App) DownloadFile(
+	peerIP string,
+	peerPort uint16,
+	fileChecksum, fileName string,
+	savePath string,
+) error {
+	conn, err := net.DialTimeout(
+		"tcp",
+		net.JoinHostPort(peerIP, fmt.Sprintf("%d", peerPort)),
+		10*time.Second,
+	)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to connect to peer %s:%d: %v", peerIP, peerPort, err)
+		return fmt.Errorf("failed to connect to peer: %w", err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(fmt.Appendf(nil, "FILE_REQUEST %s\n", fileChecksum))
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to send request to peer: %v", err)
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to read response from peer: %v", err)
+	}
+
+	response = strings.TrimSpace(response)
+	if strings.HasPrefix(response, "ERROR ") {
+		errorMsg := strings.TrimPrefix(response, "ERROR ")
+		wruntime.LogErrorf(a.ctx, "[peer] Peer returned error: %s", errorMsg)
+		return fmt.Errorf("peer error: %s", errorMsg)
+	}
+	if !strings.HasPrefix(response, "FILE_DATA ") {
+		wruntime.LogErrorf(a.ctx, "[peer] Unexpected response from peer: %s", response)
+		return fmt.Errorf("unexpected response: %s", response)
+	}
+
+	fileSizeStr := strings.TrimPrefix(response, "FILE_DATA ")
+	fileSize, err := strconv.ParseInt(fileSizeStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid file size in response: %s", fileSizeStr)
+	}
+
+	file, err := os.Create(savePath)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to create file %s: %v", savePath, err)
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	wruntime.LogInfof(
+		a.ctx,
+		"[peer] Downloading file %s (%d bytes) from %s:%d",
+		fileName,
+		fileSize,
+		peerIP,
+		peerPort,
+	)
+
+	hash := sha256.New()
+	written, err := io.CopyN(io.MultiWriter(file, hash), reader, fileSize)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file: %v", err)
+		return fmt.Errorf("failed to download file: %w", err)
+	}
+	if written != fileSize {
+		return fmt.Errorf("incomplete download: expected %d bytes, got %d", fileSize, written)
+	}
+
+	actualChecksum := hex.EncodeToString(hash.Sum(nil))
+	if actualChecksum != fileChecksum {
+		wruntime.LogErrorf(
+			a.ctx,
+			"[peer] Checksum mismatch:\nExpected: %s\nActual: %s",
+			fileChecksum,
+			actualChecksum,
+		)
+		os.Remove(savePath)
+		return fmt.Errorf("checksum verification failed")
+	}
+
+	wruntime.LogInfof(a.ctx, "[peer] Successfully downloaded and verified file %s", fileName)
+	return nil
+}
+
 func (a *App) scanDirectoryInternal(dir string) ([]protocol.FileMeta, error) {
 	var filePaths []string
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -352,32 +509,135 @@ func (a *App) announceToIndexServerInternal(indexURL string, peer protocol.PeerI
 }
 
 func (a *App) serveFilesInternal(shareDir string, port int) {
-	mux := http.NewServeMux()
-	fileServer := http.FileServer(http.Dir(shareDir))
-	mux.Handle("/files/", http.StripPrefix("/files/", fileServer))
-
-	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 20 * time.Second,
-		IdleTimeout:  30 * time.Second,
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to start TCP server on port %d: %v", port, err)
+		return
 	}
 
-	wruntime.LogInfof(a.ctx, "[peer] Starting file server. Serving files from %s on port %d at /files/", shareDir, port)
+	wruntime.LogInfof(a.ctx, "[peer] Starting TCP file server on port %d", port)
 
 	go func() {
-		<-a.ctx.Done() // Wait for Wails app to signal shutdown
-		wruntime.LogInfo(a.ctx, "[peer] Shutting down file server...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			wruntime.LogErrorf(a.ctx, "[peer] File server shutdown error: %v", err)
-		}
+		<-a.ctx.Done()
+		wruntime.LogInfof(a.ctx, "[peer] Shutting down TCP file server on port %d", port)
+		listener.Close()
 	}()
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		wruntime.LogErrorf(a.ctx, "[peer] File server ListenAndServe error on port %d: %v", port, err)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if a.ctx.Err() != nil {
+				wruntime.LogInfo(a.ctx, "[peer] TCP server stopped gracefully")
+				return
+			}
+			wruntime.LogErrorf(a.ctx, "[peer] Failed to accept connection: %v", err)
+			continue
+		}
+		go a.handleTCPConnection(conn, shareDir)
 	}
-	wruntime.LogInfo(a.ctx, "[peer] File server has stopped.")
+}
+
+func (a *App) handleTCPConnection(conn net.Conn, shareDir string) {
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+
+	reader := bufio.NewReader(conn)
+	request, err := reader.ReadString('\n')
+	if err != nil {
+		wruntime.LogWarningf(a.ctx, "[peer] Failed to read request: %v", err)
+		return
+	}
+
+	request = strings.TrimSpace(request)
+	wruntime.LogInfof(a.ctx, "[peer] Received request: %s", request)
+
+	if !strings.HasPrefix(request, "FILE_REQUEST ") {
+		conn.Write([]byte("ERROR invalid request format\n"))
+		return
+	}
+
+	checksum := strings.TrimPrefix(request, "FILE_REQUEST ")
+	checksum = strings.TrimSpace(checksum)
+	file, err := a.findFileByChecksum(shareDir, checksum)
+	if err != nil {
+		wruntime.LogWarningf(a.ctx, "[peer] File not found for checksum %s: %v", checksum, err)
+		conn.Write(fmt.Appendf(nil, "ERROR File not found: %s\n", checksum))
+		return
+	}
+
+	fileInfo, err := os.Stat(file.Path)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to stat file %s: %v", file.Path, err)
+		conn.Write([]byte("ERROR Failed to access file\n"))
+		return
+	}
+
+	_, err = conn.Write(fmt.Appendf(nil, "FILE_DATA %d\n", fileInfo.Size()))
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to send file data response header: %v", err)
+		return
+	}
+
+	fileHandle, err := os.Open(file.Path)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to open file %s: %v", file.Path, err)
+		return
+	}
+	defer fileHandle.Close()
+
+	sent, err := io.Copy(conn, fileHandle)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to send file: %v", err)
+		return
+	}
+
+	wruntime.LogInfof(
+		a.ctx,
+		"[peer] Successfully sent file %s (%d bytes) for checksum %s to %s",
+		file.Name,
+		sent,
+		checksum,
+		conn.RemoteAddr().String(),
+	)
+}
+
+func (a *App) findFileByChecksum(shareDir, checksum string) (*FileInfo, error) {
+	var result *FileInfo
+
+	err := filepath.WalkDir(shareDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		fileChecksum := protocol.GenerateChecksum(data)
+		if fileChecksum == checksum {
+			result = &FileInfo{
+				Checksum: fileChecksum,
+				Path:     path,
+				Name:     d.Name(),
+			}
+			return fs.SkipAll
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Error walking share directory %s: %v", shareDir, err)
+		return nil, fmt.Errorf("failed to walk share directory %s: %w", shareDir, err)
+	}
+
+	if result == nil {
+		return nil, fmt.Errorf("file with checksum %s not found in share directory %s", checksum, shareDir)
+	}
+	return result, nil
 }
