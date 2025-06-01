@@ -8,11 +8,11 @@ import {
 } from '../../wailsjs/go/main/App';
 import { protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
-import NetworkDiscovery from './NetworkDiscovery.vue';
-import NetworkFilesTable from './NetworkFilesTable.vue';
-import PeerConfiguration from './PeerConfiguration.vue';
-import PeerStatus from './PeerStatus.vue';
-import SharedFilesTable from './SharedFilesTable.vue';
+import NetworkDiscovery from '../components/NetworkDiscovery.vue';
+import NetworkFilesTable from '../components/NetworkFilesTable.vue';
+import PeerConfiguration from '../components/PeerConfiguration.vue';
+import PeerStatus from '../components/PeerStatus.vue';
+import SharedFilesTable from '../components/SharedFilesTable.vue';
 
 const peerConfig = reactive({
     indexURL: 'http://localhost:9090',
@@ -134,35 +134,31 @@ onUnmounted(() => {
 </script>
 
 <template>
-    <main class="container mx-auto space-y-6 p-4">
-        <h1 class="text-center text-2xl font-bold">P2P File Sharing Peer</h1>
+    <PeerConfiguration
+        :initial-config="peerConfig"
+        :is-serving="peerState.isServing"
+        :is-loading="peerState.isLoading"
+        @update:config="updatePeerConfig"
+        @select-directory="handleSelectDirectory"
+        @start-peer="handleStartPeer"
+    />
 
-        <PeerConfiguration
-            :initial-config="peerConfig"
-            :is-serving="peerState.isServing"
-            :is-loading="peerState.isLoading"
-            @update:config="updatePeerConfig"
-            @select-directory="handleSelectDirectory"
-            @start-peer="handleStartPeer"
-        />
+    <PeerStatus
+        :status-message="peerState.statusMessage"
+        :is-serving="peerState.isServing"
+        :share-dir="peerConfig.shareDir"
+    />
 
-        <PeerStatus
-            :status-message="peerState.statusMessage"
-            :is-serving="peerState.isServing"
-            :share-dir="peerConfig.shareDir"
-        />
+    <NetworkDiscovery
+        :is-querying="networkState.isQuerying"
+        :query-error="networkState.queryError"
+        :last-query-time="networkState.lastQueryTime"
+        :available-peers="networkState.availablePeers"
+        :all-network-files-count="allNetworkFiles.length"
+        @discover-peers="queryNetwork"
+    />
 
-        <NetworkDiscovery
-            :is-querying="networkState.isQuerying"
-            :query-error="networkState.queryError"
-            :last-query-time="networkState.lastQueryTime"
-            :available-peers="networkState.availablePeers"
-            :all-network-files-count="allNetworkFiles.length"
-            @discover-peers="queryNetwork"
-        />
+    <NetworkFilesTable :all-network-files="allNetworkFiles" @download-file="downloadFile" />
 
-        <NetworkFilesTable :all-network-files="allNetworkFiles" @download-file="downloadFile" />
-
-        <SharedFilesTable :shared-files="peerState.sharedFiles" :share-dir="peerConfig.shareDir" />
-    </main>
+    <SharedFilesTable :shared-files="peerState.sharedFiles" :share-dir="peerConfig.shareDir" />
 </template>

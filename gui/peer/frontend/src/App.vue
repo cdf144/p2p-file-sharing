@@ -1,7 +1,10 @@
 <script lang="ts" setup>
-import Home from './components/Home.vue';
+import DefaultLayout from './layouts/DefaultLayout.vue';
+import Home from './views/Home.vue';
 </script>
 
 <template>
-    <Home />
+    <DefaultLayout>
+        <Home />
+    </DefaultLayout>
 </template>
