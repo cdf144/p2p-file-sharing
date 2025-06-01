@@ -8,7 +8,9 @@ import {
 } from '../../wailsjs/go/main/App';
 import { protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
+import { formatFileSize } from '../utils/formatFileSize';
 import NetworkDiscovery from './NetworkDiscovery.vue';
+import NetworkFilesTable from './NetworkFilesTable.vue';
 import PeerConfiguration from './PeerConfiguration.vue';
 import PeerStatus from './PeerStatus.vue';
 
@@ -38,9 +40,6 @@ const networkState = reactive({
 const sharedFilesPerPage = ref(10);
 const currentPage = ref(1);
 
-const networkFilesPerPage = ref(10);
-const currentNetworkPage = ref(1);
-
 const sharedFilesTotalPages = computed(() => {
     return Math.ceil(peerState.sharedFiles.length / sharedFilesPerPage.value);
 });
@@ -61,41 +60,9 @@ const allNetworkFiles = computed(() => {
     return files;
 });
 
-const networkFilesTotalPages = computed(() => {
-    return Math.ceil(allNetworkFiles.value.length / networkFilesPerPage.value);
-});
-
-const networkFilesPaginated = computed(() => {
-    const start = (currentNetworkPage.value - 1) * networkFilesPerPage.value;
-    const end = currentNetworkPage.value * networkFilesPerPage.value;
-    return allNetworkFiles.value.slice(start, end);
-});
-
 const visiblePages = computed(() => {
     const total = sharedFilesTotalPages.value;
     const current = currentPage.value;
-    if (total <= MAX_VISIBLE_PAGE_BUTTONS) {
-        return Array.from({ length: total }, (_, i) => i + 1);
-    }
-
-    const half = Math.floor(MAX_VISIBLE_PAGE_BUTTONS / 2);
-    let start = current - half;
-    let end = current + half;
-    if (start < 1) {
-        start = 1;
-        end = MAX_VISIBLE_PAGE_BUTTONS;
-    }
-    if (end > total) {
-        end = total;
-        start = total - MAX_VISIBLE_PAGE_BUTTONS + 1;
-    }
-
-    return Array.from({ length: end - start + 1 }, (_, i) => start + i);
-});
-
-const visibleNetworkPages = computed(() => {
-    const total = networkFilesTotalPages.value;
-    const current = currentNetworkPage.value;
     if (total <= MAX_VISIBLE_PAGE_BUTTONS) {
         return Array.from({ length: total }, (_, i) => i + 1);
     }
@@ -122,16 +89,6 @@ const showRightEllipsis = computed(() => {
     return visiblePages.value[visiblePages.value.length - 1] < sharedFilesTotalPages.value;
 });
 
-const showNetworkLeftEllipsis = computed(() => {
-    return visibleNetworkPages.value[0] > 1;
-});
-const showNetworkRightEllipsis = computed(() => {
-    return (
-        visibleNetworkPages.value[visibleNetworkPages.value.length - 1] <
-        networkFilesTotalPages.value
-    );
-});
-
 async function handleSelectDirectory() {
     try {
         peerConfig.shareDir = '';
@@ -148,8 +105,7 @@ async function handleSelectDirectory() {
 
 async function handleStartPeer(configFromChild: typeof peerConfig) {
     if (peerState.isServing) {
-        peerState.statusMessage =
-            'Stop functionality not yet implemented. Please restart the app to stop.';
+        peerState.statusMessage = 'Stop functionality not yet implemented. Please restart the app to stop.';
         return;
     }
     peerState.isLoading = true;
@@ -189,7 +145,6 @@ async function queryNetwork() {
         const peers = await QueryIndexServer(peerConfig.indexURL);
         networkState.availablePeers = peers;
         networkState.lastQueryTime = new Date();
-        currentNetworkPage.value = 1;
     } catch (error: any) {
         networkState.queryError = `Error querying network: ${error.message || error}`;
         networkState.availablePeers = [];
@@ -224,24 +179,9 @@ onUnmounted(() => {
     }
 });
 
-function formatFileSize(bytes: number): string {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KiB', 'MiB', 'GiB', 'TiB'];
-    // Logarithm base change rule: log_k(bytes) = ln(bytes) / ln(k)
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
 function goToPage(page: number) {
     if (page >= 1 && page <= sharedFilesTotalPages.value) {
         currentPage.value = page;
-    }
-}
-
-function goToNetworkPage(page: number) {
-    if (page >= 1 && page <= networkFilesTotalPages.value) {
-        currentNetworkPage.value = page;
     }
 }
 
@@ -254,18 +194,6 @@ function prevPage() {
 function nextPage() {
     if (currentPage.value < sharedFilesTotalPages.value) {
         currentPage.value++;
-    }
-}
-
-function prevNetworkPage() {
-    if (currentNetworkPage.value > 1) {
-        currentNetworkPage.value--;
-    }
-}
-
-function nextNetworkPage() {
-    if (currentNetworkPage.value < networkFilesTotalPages.value) {
-        currentNetworkPage.value++;
     }
 }
 </script>
@@ -298,171 +226,12 @@ function nextNetworkPage() {
             @discover-peers="queryNetwork"
         />
 
-        <!-- Available Files from Network -->
-        <div class="rounded-lg bg-gray-700 p-4 shadow" v-if="allNetworkFiles.length > 0">
-            <div class="mb-4 flex items-center justify-between">
-                <h3 class="text-lg font-semibold">Available Files from Network</h3>
-                <div class="flex items-center space-x-2">
-                    <label for="networkFilesPerPage" class="text-sm text-gray-300"
-                        >Files per page:</label
-                    >
-                    <select
-                        id="networkFilesPerPage"
-                        v-model.number="networkFilesPerPage"
-                        @change="currentNetworkPage = 1"
-                        class="appearance-none rounded border border-gray-500 bg-gray-600 px-2 py-1 text-sm text-white hover:border-indigo-500 focus:ring-1 focus:ring-indigo-500 focus:outline-none"
-                    >
-                        <option v-for="option in [5, 10, 20, 50]" :key="option">
-                            {{ option }}
-                        </option>
-                    </select>
-                </div>
-            </div>
-
-            <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-600">
-                    <thead class="bg-gray-600">
-                        <tr>
-                            <th
-                                scope="col"
-                                class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
-                            >
-                                File Name
-                            </th>
-                            <th
-                                scope="col"
-                                class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
-                            >
-                                Size
-                            </th>
-                            <th
-                                scope="col"
-                                class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
-                            >
-                                Peer IP:Port
-                            </th>
-                            <th
-                                scope="col"
-                                class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
-                            >
-                                Checksum
-                            </th>
-                            <th
-                                scope="col"
-                                class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
-                            >
-                                Action
-                            </th>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-gray-600 bg-gray-700">
-                        <tr
-                            v-for="{ file, peer } in networkFilesPaginated"
-                            :key="`${peer.IP.toString()}-${peer.Port}-${file.Checksum}`"
-                        >
-                            <td
-                                class="px-6 py-4 text-left text-sm font-medium whitespace-nowrap text-gray-200"
-                            >
-                                {{ file.Name }}
-                            </td>
-                            <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
-                                {{ formatFileSize(file.Size) }}
-                            </td>
-                            <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
-                                {{ peer.IP.toString() }}:{{ peer.Port }}
-                            </td>
-                            <td
-                                class="truncate px-6 py-4 text-left text-sm text-gray-300"
-                                :title="file.Checksum"
-                            >
-                                {{ file.Checksum.substring(0, 16) }}...
-                            </td>
-                            <td class="px-6 py-4 text-left text-sm whitespace-nowrap">
-                                <button
-                                    @click="downloadFile(file, peer)"
-                                    class="focus:ring-opacity-50 rounded bg-green-600 px-3 py-1 text-sm text-white hover:bg-green-700 focus:ring-2 focus:ring-green-500 focus:outline-none"
-                                >
-                                    Download
-                                </button>
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- Pagination for network files -->
-            <div class="mt-4 flex items-center justify-between" v-if="networkFilesTotalPages > 1">
-                <div class="text-sm text-gray-300">
-                    Showing {{ (currentNetworkPage - 1) * networkFilesPerPage + 1 }} to
-                    {{ Math.min(currentNetworkPage * networkFilesPerPage, allNetworkFiles.length) }}
-                    of {{ allNetworkFiles.length }} files
-                </div>
-
-                <div class="flex items-center space-x-2">
-                    <button
-                        @click="prevNetworkPage"
-                        :disabled="currentNetworkPage === 1"
-                        class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                        Previous
-                    </button>
-
-                    <div class="flex space-x-1">
-                        <button
-                            v-if="showNetworkLeftEllipsis"
-                            @click="goToNetworkPage(1)"
-                            class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500"
-                        >
-                            1
-                        </button>
-
-                        <span v-if="showNetworkLeftEllipsis" class="px-2 text-gray-400">...</span>
-
-                        <button
-                            v-for="page in visibleNetworkPages"
-                            :key="page"
-                            @click="goToNetworkPage(page)"
-                            :class="[
-                                'rounded px-3 py-1 text-sm',
-                                currentNetworkPage === page
-                                    ? 'bg-blue-600 text-white'
-                                    : 'bg-gray-600 hover:bg-gray-500',
-                            ]"
-                        >
-                            {{ page }}
-                        </button>
-
-                        <span v-if="showNetworkRightEllipsis" class="px-2 text-gray-400">...</span>
-
-                        <button
-                            v-if="showNetworkRightEllipsis"
-                            @click="goToNetworkPage(networkFilesTotalPages)"
-                            class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500"
-                        >
-                            {{ networkFilesTotalPages }}
-                        </button>
-                    </div>
-
-                    <button
-                        @click="nextNetworkPage"
-                        :disabled="currentNetworkPage === networkFilesTotalPages"
-                        class="rounded bg-gray-600 px-3 py-1 text-sm hover:bg-gray-500 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                        Next
-                    </button>
-                </div>
-            </div>
-        </div>
+        <NetworkFilesTable :all-network-files="allNetworkFiles" @download-file="downloadFile" />
 
         <!-- Shared Files from this Peer -->
-        <div
-            class="rounded-lg bg-gray-700 p-4 shadow"
-            v-if="peerConfig.shareDir && peerState.sharedFiles.length > 0"
-        >
+        <div class="rounded-lg bg-gray-700 p-4 shadow" v-if="peerConfig.shareDir && peerState.sharedFiles.length > 0">
             <div class="mb-4 flex items-center justify-between">
-                <h3 class="text-lg font-semibold">
-                    Shared Files (from: {{ peerConfig.shareDir }})
-                </h3>
+                <h3 class="text-lg font-semibold">Shared Files (from: {{ peerConfig.shareDir }})</h3>
 
                 <div class="flex items-center space-x-2">
                     <label for="filesPerPage" class="text-sm text-gray-300">Files per page:</label>
@@ -505,18 +274,13 @@ function nextNetworkPage() {
                     </thead>
                     <tbody class="divide-y divide-gray-600 bg-gray-700">
                         <tr v-for="file in sharedFilesPaginated" :key="file.Checksum">
-                            <td
-                                class="px-6 py-4 text-left text-sm font-medium whitespace-nowrap text-gray-200"
-                            >
+                            <td class="px-6 py-4 text-left text-sm font-medium whitespace-nowrap text-gray-200">
                                 {{ file.Name }}
                             </td>
                             <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
                                 {{ formatFileSize(file.Size) }}
                             </td>
-                            <td
-                                class="truncate px-6 py-4 text-left text-sm text-gray-300"
-                                :title="file.Checksum"
-                            >
+                            <td class="truncate px-6 py-4 text-left text-sm text-gray-300" :title="file.Checksum">
                                 {{ file.Checksum }}
                             </td>
                         </tr>
@@ -557,9 +321,7 @@ function nextNetworkPage() {
                             @click="goToPage(page)"
                             :class="[
                                 'rounded px-3 py-1 text-sm',
-                                currentPage === page
-                                    ? 'bg-blue-600 text-white'
-                                    : 'bg-gray-600 hover:bg-gray-500',
+                                currentPage === page ? 'bg-blue-600 text-white' : 'bg-gray-600 hover:bg-gray-500',
                             ]"
                         >
                             {{ page }}
@@ -587,9 +349,7 @@ function nextNetworkPage() {
             </div>
         </div>
         <div class="rounded-lg bg-gray-700 p-4 shadow" v-else-if="peerConfig.shareDir">
-            <p class="text-red-400">
-                No files found in '{{ peerConfig.shareDir }}' or directory not yet scanned.
-            </p>
+            <p class="text-red-400">No files found in '{{ peerConfig.shareDir }}' or directory not yet scanned.</p>
         </div>
     </main>
 </template>
