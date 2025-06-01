@@ -8,6 +8,9 @@ import {
 } from '../../wailsjs/go/main/App';
 import { protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
+import NetworkDiscovery from './NetworkDiscovery.vue';
+import PeerConfiguration from './PeerConfiguration.vue';
+import PeerStatus from './PeerStatus.vue';
 
 const MAX_VISIBLE_PAGE_BUTTONS = 5;
 
@@ -129,7 +132,7 @@ const showNetworkRightEllipsis = computed(() => {
     );
 });
 
-async function selectDirectory() {
+async function handleSelectDirectory() {
     try {
         peerConfig.shareDir = '';
         peerState.statusMessage = 'Selected directory. Scanning for files...';
@@ -143,7 +146,7 @@ async function selectDirectory() {
     }
 }
 
-async function startPeer() {
+async function handleStartPeer(configFromChild: typeof peerConfig) {
     if (peerState.isServing) {
         peerState.statusMessage =
             'Stop functionality not yet implemented. Please restart the app to stop.';
@@ -152,6 +155,10 @@ async function startPeer() {
     peerState.isLoading = true;
     peerState.statusMessage = 'Starting peer...';
     try {
+        peerConfig.indexURL = configFromChild.indexURL;
+        peerConfig.servePort = configFromChild.servePort;
+        peerConfig.publicPort = configFromChild.publicPort;
+
         const result = await StartPeerLogic(
             peerConfig.indexURL,
             peerConfig.shareDir,
@@ -167,6 +174,12 @@ async function startPeer() {
     } finally {
         peerState.isLoading = false;
     }
+}
+
+function updatePeerConfig(newConfig: typeof peerConfig) {
+    peerConfig.indexURL = newConfig.indexURL;
+    peerConfig.servePort = newConfig.servePort;
+    peerConfig.publicPort = newConfig.publicPort;
 }
 
 async function queryNetwork() {
@@ -261,126 +274,29 @@ function nextNetworkPage() {
     <main class="container mx-auto space-y-6 p-4">
         <h1 class="text-center text-2xl font-bold">P2P File Sharing Peer</h1>
 
-        <!-- Peer Configuration (Index Server, Share Directory, Ports) -->
-        <div class="space-y-4 rounded-lg bg-gray-700 p-6 shadow-lg">
-            <h2 class="text-xl font-semibold">Peer Configuration</h2>
-            <div>
-                <label for="indexURL" class="block text-sm font-medium text-gray-300"
-                    >Index Server URL:</label
-                >
-                <input
-                    id="indexURL"
-                    v-model="peerConfig.indexURL"
-                    type="text"
-                    class="mt-1 block w-full rounded-md border-gray-500 bg-gray-600 px-3 py-2 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 focus:outline-none sm:text-sm"
-                    :disabled="peerState.isServing || peerState.isLoading"
-                />
-            </div>
+        <PeerConfiguration
+            :initial-config="peerConfig"
+            :is-serving="peerState.isServing"
+            :is-loading="peerState.isLoading"
+            @update:config="updatePeerConfig"
+            @select-directory="handleSelectDirectory"
+            @start-peer="handleStartPeer"
+        />
 
-            <div class="flex items-end space-x-2">
-                <div class="flex-grow">
-                    <label for="shareDir" class="block text-sm font-medium text-gray-300"
-                        >Share Directory:</label
-                    >
-                    <input
-                        id="shareDir"
-                        v-model="peerConfig.shareDir"
-                        type="text"
-                        readonly
-                        class="mt-1 block w-full cursor-not-allowed rounded-md border-gray-500 bg-gray-500 px-3 py-2 shadow-sm sm:text-sm"
-                        placeholder="Click 'Select Directory' button"
-                    />
-                </div>
-                <button
-                    @click="selectDirectory"
-                    class="focus:ring-opacity-50 rounded-md bg-blue-600 px-4 py-2 font-semibold text-white shadow hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:opacity-50"
-                    :disabled="peerState.isServing || peerState.isLoading"
-                >
-                    Select Directory
-                </button>
-            </div>
+        <PeerStatus
+            :status-message="peerState.statusMessage"
+            :is-serving="peerState.isServing"
+            :share-dir="peerConfig.shareDir"
+        />
 
-            <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-                <div>
-                    <label for="servePort" class="block text-sm font-medium text-gray-300"
-                        >Internal Serve Port (0 for random):</label
-                    >
-                    <input
-                        id="servePort"
-                        v-model.number="peerConfig.servePort"
-                        type="number"
-                        min="0"
-                        class="mt-1 block w-full rounded-md border-gray-500 bg-gray-600 px-3 py-2 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 focus:outline-none sm:text-sm"
-                        :disabled="peerState.isServing || peerState.isLoading"
-                    />
-                </div>
-                <div>
-                    <label for="publicPort" class="block text-sm font-medium text-gray-300"
-                        >Public Announce Port (0 for internal):</label
-                    >
-                    <input
-                        id="publicPort"
-                        v-model.number="peerConfig.publicPort"
-                        type="number"
-                        min="0"
-                        class="mt-1 block w-full rounded-md border-gray-500 bg-gray-600 px-3 py-2 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 focus:outline-none sm:text-sm"
-                        :disabled="peerState.isServing || peerState.isLoading"
-                    />
-                </div>
-            </div>
-
-            <button
-                @click="startPeer"
-                class="focus:ring-opacity-50 w-full rounded-md px-4 py-2 font-semibold shadow focus:ring-2 focus:outline-none disabled:opacity-50"
-                :class="
-                    peerState.isServing
-                        ? 'bg-red-600 hover:bg-red-700'
-                        : 'bg-green-600 hover:bg-green-700'
-                "
-                :disabled="peerState.isLoading"
-            >
-                <span v-if="peerState.isLoading">Processing...</span>
-                <span v-else-if="peerState.isServing">Stop Peer (Not Implemented)</span>
-                <span v-else>Start Peer</span>
-            </button>
-        </div>
-
-        <!-- Peer Status Display -->
-        <div class="rounded-lg bg-gray-700 p-4 shadow">
-            <h3 class="font-semibold">Status:</h3>
-            <p class="break-all text-gray-300">{{ peerState.statusMessage }}</p>
-            <p v-if="peerState.isServing" class="text-green-400">
-                Peer is serving files from: {{ peerConfig.shareDir || 'not set' }}
-            </p>
-        </div>
-
-        <!-- Network Discovery -->
-        <div class="space-y-4 rounded-lg bg-gray-700 p-6 shadow-lg">
-            <div class="flex items-center justify-between">
-                <h2 class="text-xl font-semibold">Network Discovery</h2>
-                <button
-                    @click="queryNetwork"
-                    class="focus:ring-opacity-50 rounded-md bg-purple-600 px-4 py-2 font-semibold text-white shadow hover:bg-purple-700 focus:ring-2 focus:ring-purple-500 focus:outline-none disabled:opacity-50"
-                    :disabled="networkState.isQuerying"
-                >
-                    <span v-if="networkState.isQuerying">Discovering...</span>
-                    <span v-else>Discover Peers</span>
-                </button>
-            </div>
-
-            <div v-if="networkState.queryError" class="text-red-400">
-                {{ networkState.queryError }}
-            </div>
-
-            <div v-if="networkState.lastQueryTime" class="text-sm text-gray-400">
-                Last updated: {{ networkState.lastQueryTime.toLocaleString() }}
-            </div>
-
-            <div v-if="networkState.availablePeers.length > 0" class="text-sm text-gray-300">
-                Found {{ networkState.availablePeers.length }} peer(s) sharing
-                {{ allNetworkFiles.length }} file(s)
-            </div>
-        </div>
+        <NetworkDiscovery
+            :is-querying="networkState.isQuerying"
+            :query-error="networkState.queryError"
+            :last-query-time="networkState.lastQueryTime"
+            :available-peers="networkState.availablePeers"
+            :all-network-files-count="allNetworkFiles.length"
+            @discover-peers="queryNetwork"
+        />
 
         <!-- Available Files from Network -->
         <div class="rounded-lg bg-gray-700 p-4 shadow" v-if="allNetworkFiles.length > 0">

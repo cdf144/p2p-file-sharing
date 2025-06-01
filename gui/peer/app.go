@@ -630,7 +630,6 @@ func (a *App) findFileByChecksum(shareDir, checksum string) (*FileInfo, error) {
 
 		return nil
 	})
-
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Error walking share directory %s: %v", shareDir, err)
 		return nil, fmt.Errorf("failed to walk share directory %s: %w", shareDir, err)
