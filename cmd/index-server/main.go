@@ -36,6 +36,7 @@ func main() {
 	http.HandleFunc("/search", indexServer.handleSearch)
 	http.HandleFunc("/peers", indexServer.handleAllPeers)
 	http.HandleFunc("/peers/{checksum}", indexServer.handleOnePeers)
+	// TODO: Add a de-announce endpoint.
 
 	log.Printf("[index-server] Starting server on %s", httpServer.Addr)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
