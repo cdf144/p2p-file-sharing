@@ -86,11 +86,7 @@ func (a *App) SelectShareDirectory() (string, error) {
 
 func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort int) (string, error) {
 	if a.corePeer.IsServing() {
-		// NOTE: We can either return a message indicating the peer is already running and not start a new one,
-		// or stop the current instance and start a new one.
-		// Here we choose to stop the current instance and start a new one.
-		wruntime.LogInfo(a.ctx, "[peer] Peer is already running. Stopping current instance before starting new one.")
-		a.corePeer.Stop()
+		return "Peer is already running", nil
 	}
 
 	absShareDir := ""
@@ -103,15 +99,18 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 		}
 	}
 
-	// TODO: Update the existing a.corePeer instance's config instead of creating a new one.
-	// Requires a UpdateConfig method in corepeer.CorePeer.
-	a.corePeer = corepeer.NewCorePeer(corepeer.Config{
+	newConfig := corepeer.Config{
 		IndexURL:    indexURL,
 		ShareDir:    absShareDir,
 		ServePort:   servePort,
 		PublicPort:  publicPort,
 		FileScanCtx: a.ctx,
-	})
+	}
+
+	if err := a.corePeer.UpdateConfig(newConfig); err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
+		return "", fmt.Errorf("failed to update CorePeer config: %w", err)
+	}
 
 	wruntime.LogInfof(
 		a.ctx,

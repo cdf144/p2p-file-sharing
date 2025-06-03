@@ -187,12 +187,44 @@ func (p *CorePeer) Stop() {
 	// TODO: Send a de-announce to the index server (when implemented).
 }
 
-// TODO: Implement a UpdateConfig method to change settings.
-
+// GetConfig returns a copy of the current configuration of the CorePeer.
 func (p *CorePeer) GetConfig() Config {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.config
+}
+
+// UpdateConfig updates the configuration of the CorePeer.
+// This method should ideally be called when the peer is not serving.
+// Changes to IndexURL, ShareDir, ServePort, PublicPort, and FileScanCtx will be applied.
+// The logger is not updated by this method.
+func (p *CorePeer) UpdateConfig(cfg Config) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.isServing {
+		p.logger.Println("Warning: Updating configuration while peer is serving. Some changes may require a restart of the peer to take full effect.")
+	}
+
+	p.config.IndexURL = cfg.IndexURL
+	p.config.ServePort = cfg.ServePort
+	p.config.PublicPort = cfg.PublicPort
+	p.config.FileScanCtx = cfg.FileScanCtx
+
+	if p.config.ShareDir != cfg.ShareDir {
+		p.config.ShareDir = cfg.ShareDir
+		p.logger.Printf(
+			"Share directory in config updated to: %s. This will be used on next Start() or manual file scan.",
+			p.config.ShareDir,
+		)
+	}
+
+	p.logger.Printf(
+		"CorePeer configuration updated. IndexURL: %s, ServePort: %d, PublicPort: %d",
+		p.config.IndexURL, p.config.ServePort, p.config.PublicPort,
+	)
+
+	return nil
 }
 
 // IsServing returns true if the peer is currently active.
