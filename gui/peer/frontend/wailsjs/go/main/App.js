@@ -25,3 +25,7 @@ export function SelectShareDirectory() {
 export function StartPeerLogic(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['StartPeerLogic'](arg1, arg2, arg3, arg4);
 }
+
+export function StopPeerLogic() {
+  return window['go']['main']['App']['StopPeerLogic']();
+}

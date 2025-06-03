@@ -130,6 +130,23 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 	return statusMsg, nil
 }
 
+func (a *App) StopPeerLogic() error {
+	wruntime.LogInfo(a.ctx, "[peer] Attempting to stop CorePeer...")
+	if a.corePeer == nil {
+		wruntime.LogInfo(a.ctx, "[peer] CorePeer not initialized, nothing to stop.")
+		return fmt.Errorf("CorePeer not initialized")
+	}
+
+	if !a.corePeer.IsServing() {
+		wruntime.LogInfo(a.ctx, "[peer] CorePeer is not running, no action taken.")
+		return nil
+	}
+
+	a.corePeer.Stop()
+	wruntime.LogInfo(a.ctx, "[peer] CorePeer stopped.")
+	return nil
+}
+
 func (a *App) QueryIndexServer(indexURL string) ([]protocol.PeerInfo, error) {
 	wruntime.LogInfof(a.ctx, "[peer] Querying index server: %s", indexURL)
 	if a.corePeer == nil { // Should be initialized in startup, but just in case

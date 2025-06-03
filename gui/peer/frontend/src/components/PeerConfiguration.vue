@@ -12,7 +12,7 @@ const props = defineProps<{
     isLoading: boolean;
 }>();
 
-const emit = defineEmits(['update:config', 'start-peer', 'select-directory']);
+const emit = defineEmits(['update:config', 'toggle-start-stop-peer', 'select-directory']);
 
 const localConfig = reactive({ ...props.initialConfig });
 
@@ -24,8 +24,8 @@ function selectDirectory() {
     emit('select-directory');
 }
 
-function startPeer() {
-    emit('start-peer', { ...localConfig });
+function toggleStartStopPeer() {
+    emit('toggle-start-stop-peer', { ...localConfig });
 }
 </script>
 
@@ -97,13 +97,13 @@ function startPeer() {
         </div>
 
         <button
-            @click="startPeer"
+            @click="toggleStartStopPeer"
             class="focus:ring-opacity-50 w-full rounded-md px-4 py-2 font-semibold shadow focus:ring-2 focus:outline-none disabled:opacity-50"
             :class="isServing ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'"
             :disabled="isLoading"
         >
             <span v-if="isLoading">Processing...</span>
-            <span v-else-if="isServing">Stop Peer (Not Implemented)</span>
+            <span v-else-if="isServing">Stop Peer</span>
             <span v-else>Start Peer</span>
         </button>
     </div>

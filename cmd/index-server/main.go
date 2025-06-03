@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -36,7 +37,7 @@ func main() {
 	http.HandleFunc("/search", indexServer.handleSearch)
 	http.HandleFunc("/peers", indexServer.handleAllPeers)
 	http.HandleFunc("/peers/{checksum}", indexServer.handleOnePeers)
-	// TODO: Add a de-announce endpoint.
+	http.HandleFunc("/deannounce", indexServer.handleDeannounce)
 
 	log.Printf("[index-server] Starting server on %s", httpServer.Addr)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -60,9 +61,36 @@ func (s *IndexServer) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf(
 		"[index-server] Registered peer %s:%d with %d files\n",
-		peer.IP,
-		peer.Port,
-		len(peer.Files),
+		peer.IP, peer.Port, len(peer.Files),
+	)
+}
+
+func (s *IndexServer) handleDeannounce(w http.ResponseWriter, r *http.Request) {
+	var peer protocol.PeerInfo
+	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
+		http.Error(w, "invalid JSON request body", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// PERF: This should be optimized once we have a persistent storage solution.
+	for _, file := range peer.Files {
+		if peers, ok := s.files[file.Checksum]; ok {
+			for i, p := range peers {
+				if p.IP.Equal(peer.IP) && p.Port == peer.Port {
+					s.files[file.Checksum] = slices.Delete(peers, i, i+1)
+					break
+				}
+			}
+			if len(s.files[file.Checksum]) == 0 {
+				delete(s.files, file.Checksum)
+				delete(s.fileInfo, file.Checksum)
+			}
+		}
+	}
+	log.Printf(
+		"[index-server] Deregistered peer %s:%d with %d files\n",
+		peer.IP, peer.Port, len(peer.Files),
 	)
 }
 

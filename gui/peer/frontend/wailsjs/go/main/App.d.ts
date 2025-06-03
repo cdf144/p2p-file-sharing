@@ -13,3 +13,5 @@ export function QueryIndexServer(arg1:string):Promise<Array<protocol.PeerInfo>>;
 export function SelectShareDirectory():Promise<string>;
 
 export function StartPeerLogic(arg1:string,arg2:string,arg3:number,arg4:number):Promise<string>;
+
+export function StopPeerLogic():Promise<void>;

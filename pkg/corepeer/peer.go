@@ -184,7 +184,17 @@ func (p *CorePeer) Stop() {
 		p.listener.Close()
 	}
 	p.logger.Println("Peer stopped.")
-	// TODO: Send a de-announce to the index server (when implemented).
+
+	peerInfo := protocol.PeerInfo{
+		IP:    p.announcedIP,
+		Port:  p.announcedPort,
+		Files: p.sharedFiles,
+	}
+	if err := p.deannounce(p.config.IndexURL, peerInfo); err != nil {
+		p.logger.Printf("Warning: Failed to de-announce from index server: %v", err)
+	} else {
+		p.logger.Println("Successfully de-announced from index server.")
+	}
 }
 
 // GetConfig returns a copy of the current configuration of the CorePeer.
@@ -447,6 +457,42 @@ func (p *CorePeer) announce(indexURL string, peerInfo protocol.PeerInfo) error {
 		return fmt.Errorf("server returned status %s: %s", resp.Status, string(respBody))
 	}
 	p.logger.Printf("Successfully announced to index server: %s", announceURL)
+	return nil
+}
+
+func (p *CorePeer) deannounce(indexURL string, peerInfo protocol.PeerInfo) error {
+	if indexURL == "" {
+		p.logger.Println("IndexURL is not configured. Skipping de-announce.")
+		return nil
+	}
+
+	jsonData, err := json.Marshal(peerInfo)
+	if err != nil {
+		return fmt.Errorf("failed to marshal peer info for de-announce: %w", err)
+	}
+
+	deannounceURL := indexURL + "/deannounce"
+	reqCtx, cancelReq := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelReq()
+
+	req, err := http.NewRequestWithContext(reqCtx, "POST", deannounceURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create de-announce request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("de-announce request to index server failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("index server returned status %s for de-announce: %s", resp.Status, string(respBody))
+	}
+	p.logger.Printf("Successfully de-announced from index server: %s", deannounceURL)
 	return nil
 }
 

@@ -42,5 +42,6 @@ function discoverPeers() {
         <div v-if="availablePeersCount > 0" class="text-sm text-gray-300">
             Found {{ availablePeersCount }} peer(s) sharing {{ allNetworkFilesCount }} file(s)
         </div>
+        <div v-else-if="lastQueryTime" class="text-sm text-gray-300">No peers found on the index server.</div>
     </div>
 </template>

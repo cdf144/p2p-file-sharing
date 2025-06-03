@@ -5,6 +5,7 @@ import {
     QueryIndexServer,
     SelectShareDirectory,
     StartPeerLogic,
+    StopPeerLogic,
 } from '../../wailsjs/go/main/App';
 import { protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
@@ -59,12 +60,26 @@ async function handleSelectDirectory() {
     }
 }
 
-async function handleStartPeer(configFromChild: typeof peerConfig) {
+async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
+    peerState.isLoading = true;
+
+    // Stop
     if (peerState.isServing) {
-        peerState.statusMessage = 'Stop functionality not yet implemented. Please restart the app to stop.';
+        peerState.statusMessage = 'Stopping peer...';
+        try {
+            await StopPeerLogic();
+            peerState.statusMessage = 'Peer stopped successfully.';
+            peerState.isServing = false;
+        } catch (error: any) {
+            LogError(`Error stopping peer: ${error}`);
+            peerState.statusMessage = `Error stopping peer: ${error.message || error}`;
+        } finally {
+            peerState.isLoading = false;
+        }
         return;
     }
-    peerState.isLoading = true;
+
+    // Start
     peerState.statusMessage = 'Starting peer...';
     try {
         peerConfig.indexURL = configFromChild.indexURL;
@@ -99,7 +114,7 @@ async function queryNetwork() {
     networkState.queryError = '';
     try {
         const peers = await QueryIndexServer(peerConfig.indexURL);
-        networkState.availablePeers = peers;
+        networkState.availablePeers = peers ? peers : [];
         networkState.lastQueryTime = new Date();
     } catch (error: any) {
         networkState.queryError = `Error querying network: ${error.message || error}`;
@@ -140,7 +155,7 @@ onUnmounted(() => {
         :is-loading="peerState.isLoading"
         @update:config="updatePeerConfig"
         @select-directory="handleSelectDirectory"
-        @start-peer="handleStartPeer"
+        @toggle-start-stop-peer="handleToggleStartStopPeer"
     />
 
     <PeerStatus
