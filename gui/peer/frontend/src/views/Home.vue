@@ -2,7 +2,8 @@
 import { computed, onMounted, onUnmounted, reactive } from 'vue';
 import {
     DownloadFileWithDialog,
-    QueryIndexServer,
+    FetchNetworkFiles,
+    FetchPeersForFile,
     SelectShareDirectory,
     StartPeerLogic,
     StopPeerLogic,
@@ -30,21 +31,13 @@ const peerState = reactive({
 });
 
 const networkState = reactive({
-    availablePeers: [] as protocol.PeerInfo[],
+    networkFiles: [] as protocol.FileMeta[],
     isQuerying: false,
     queryError: '',
     lastQueryTime: null as Date | null,
 });
 
-const allNetworkFiles = computed(() => {
-    const files: Array<{ file: protocol.FileMeta; peer: protocol.PeerInfo }> = [];
-    for (const peer of networkState.availablePeers) {
-        for (const file of peer.Files) {
-            files.push({ file, peer });
-        }
-    }
-    return files;
-});
+const allNetworkFiles = computed(() => networkState.networkFiles || []);
 
 async function handleSelectDirectory() {
     try {
@@ -113,24 +106,39 @@ async function queryNetwork() {
     networkState.isQuerying = true;
     networkState.queryError = '';
     try {
-        const peers = await QueryIndexServer(peerConfig.indexURL);
-        networkState.availablePeers = peers ? peers : [];
+        const files = await FetchNetworkFiles();
+        networkState.networkFiles = files ? files : [];
         networkState.lastQueryTime = new Date();
     } catch (error: any) {
         networkState.queryError = `Error querying network: ${error.message || error}`;
-        networkState.availablePeers = [];
+        networkState.networkFiles = [];
     } finally {
         networkState.isQuerying = false;
     }
 }
 
-async function downloadFile(file: protocol.FileMeta, peer: protocol.PeerInfo) {
+async function downloadFile(file: protocol.FileMeta) {
     try {
-        const peerIP = peer.IP.toString();
-        const result = await DownloadFileWithDialog(peerIP, peer.Port, file.Checksum, file.Name);
+        peerState.statusMessage = `Fetching peers for ${file.name}...`;
+        // Fetch peers that have this file using its checksum
+        // The indexURL is implicitly used by the backend's corePeer configuration
+        const peers = await FetchPeersForFile(file.checksum);
+
+        if (!peers || peers.length === 0) {
+            const errorMessage = `No peers found for file ${file.name} (checksum: ${file.checksum}).`;
+            peerState.statusMessage = errorMessage;
+            LogError(errorMessage);
+            return;
+        }
+
+        // TODO: Implement parallel download of chunks from multiple peers
+        const selectedPeerAddress = peers[0];
+
+        peerState.statusMessage = `Downloading ${file.name} from peer...`;
+        const result = await DownloadFileWithDialog(selectedPeerAddress, file.checksum, file.name);
         peerState.statusMessage = result;
     } catch (error: any) {
-        LogError(`Error downloading file: ${error}`);
+        LogError(`Error in download process for ${file.name}: ${error}`);
         peerState.statusMessage = `Error downloading file: ${error.message || error}`;
     }
 }
@@ -168,7 +176,7 @@ onUnmounted(() => {
         :is-querying="networkState.isQuerying"
         :query-error="networkState.queryError"
         :last-query-time="networkState.lastQueryTime"
-        :available-peers="networkState.availablePeers"
+        :network-files="networkState.networkFiles"
         :all-network-files-count="allNetworkFiles.length"
         @discover-peers="queryNetwork"
     />

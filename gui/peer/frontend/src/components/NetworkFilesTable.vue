@@ -6,7 +6,7 @@ import { formatFileSize } from '../utils/formatFileSize';
 const MAX_VISIBLE_PAGE_BUTTONS = 5;
 
 const props = defineProps<{
-    allNetworkFiles: Array<{ file: protocol.FileMeta; peer: protocol.PeerInfo }>;
+    allNetworkFiles: protocol.FileMeta[];
 }>();
 
 const emit = defineEmits(['download-file']);
@@ -72,8 +72,8 @@ function nextPage() {
     }
 }
 
-function handleDownloadFile(file: protocol.FileMeta, peer: protocol.PeerInfo) {
-    emit('download-file', file, peer);
+function handleDownloadFile(file: protocol.FileMeta) {
+    emit('download-file', file);
 }
 
 // Reset to page 1 if the total number of files changes (e.g., new network query) or if filesPerPage changes
@@ -130,12 +130,6 @@ watch(filesPerPage, () => {
                             scope="col"
                             class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
                         >
-                            Peer IP:Port
-                        </th>
-                        <th
-                            scope="col"
-                            class="px-6 py-3 text-left text-xs font-medium tracking-wider text-gray-300 uppercase"
-                        >
                             Checksum
                         </th>
                         <th
@@ -147,25 +141,24 @@ watch(filesPerPage, () => {
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-600 bg-gray-700">
-                    <tr
-                        v-for="{ file, peer } in paginatedFiles"
-                        :key="`${peer.IP.toString()}-${peer.Port}-${file.Checksum}`"
-                    >
+                    <tr v-for="file in paginatedFiles" :key="file.checksum">
                         <td class="px-6 py-4 text-left text-sm font-medium whitespace-nowrap text-gray-200">
-                            {{ file.Name }}
+                            {{ file.name }}
                         </td>
                         <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
-                            {{ formatFileSize(file.Size) }}
+                            {{ formatFileSize(file.size) }}
                         </td>
+                        <!-- REMOVE PEER IP:PORT CELL
                         <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
                             {{ peer.IP.toString() }}:{{ peer.Port }}
                         </td>
-                        <td class="truncate px-6 py-4 text-left text-sm text-gray-300" :title="file.Checksum">
-                            {{ file.Checksum.substring(0, 16) }}...
+                        -->
+                        <td class="truncate px-6 py-4 text-left text-sm text-gray-300" :title="file.checksum">
+                            {{ file.checksum.substring(0, 16) }}...
                         </td>
                         <td class="px-6 py-4 text-left text-sm whitespace-nowrap">
                             <button
-                                @click="handleDownloadFile(file, peer)"
+                                @click="handleDownloadFile(file)"
                                 class="focus:ring-opacity-50 rounded bg-green-600 px-3 py-1 text-sm text-white hover:bg-green-700 focus:ring-2 focus:ring-green-500 focus:outline-none"
                             >
                                 Download

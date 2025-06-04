@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
+	"net/netip"
 	"path/filepath"
 
 	"github.com/cdf144/p2p-file-sharing/pkg/corepeer"
@@ -31,7 +31,7 @@ func NewApp() *App {
 // so we can call the runtime methods
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	a.corePeer = corepeer.NewCorePeer(corepeer.Config{})
+	a.corePeer = corepeer.NewCorePeer(corepeer.CorePeerConfig{})
 	wruntime.LogInfo(ctx, "[peer] Application started. CorePeer initialized.")
 }
 
@@ -39,7 +39,7 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) shutdown(ctx context.Context) {
 	wruntime.LogInfo(ctx, "[peer] Application shutting down...")
 	if a.corePeer != nil && a.corePeer.IsServing() {
-		a.corePeer.Stop()
+		a.corePeer.Stop(a.ctx)
 		wruntime.LogInfo(ctx, "[peer] CorePeer stopped gracefully.")
 	}
 }
@@ -60,9 +60,8 @@ func (a *App) DummyFileMeta() protocol.FileMeta {
 // It's not intended to be called by the frontend for any real purpose.
 func (a *App) DummyPeerInfo() protocol.PeerInfo {
 	return protocol.PeerInfo{
-		IP:    net.IPv4(127, 0, 0, 1),
-		Port:  8080,
-		Files: []protocol.FileMeta{},
+		Address: netip.AddrPort{},
+		Files:   []protocol.FileMeta{},
 	}
 }
 
@@ -74,7 +73,7 @@ func (a *App) SelectShareDirectory() (string, error) {
 		return "", fmt.Errorf("failed to select directory: %w", err)
 	}
 
-	err = a.corePeer.SetSharedDirectory(dir)
+	err = a.corePeer.SetSharedDirectory(a.ctx, dir)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to set shared directory: %v", err)
 		return "", fmt.Errorf("failed to set shared directory: %w", err)
@@ -99,12 +98,11 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 		}
 	}
 
-	newConfig := corepeer.Config{
-		IndexURL:    indexURL,
-		ShareDir:    absShareDir,
-		ServePort:   servePort,
-		PublicPort:  publicPort,
-		FileScanCtx: a.ctx,
+	newConfig := corepeer.CorePeerConfig{
+		IndexURL:   indexURL,
+		ShareDir:   absShareDir,
+		ServePort:  servePort,
+		PublicPort: publicPort,
 	}
 
 	if err := a.corePeer.UpdateConfig(newConfig); err != nil {
@@ -118,7 +116,7 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 		indexURL, absShareDir, servePort, publicPort,
 	)
 
-	statusMsg, err := a.corePeer.Start()
+	statusMsg, err := a.corePeer.Start(a.ctx)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to start CorePeer: %v", err)
 		return "", fmt.Errorf("failed to start peer: %w", err)
@@ -142,29 +140,46 @@ func (a *App) StopPeerLogic() error {
 		return nil
 	}
 
-	a.corePeer.Stop()
+	a.corePeer.Stop(a.ctx)
 	wruntime.LogInfo(a.ctx, "[peer] CorePeer stopped.")
 	return nil
 }
 
-func (a *App) QueryIndexServer(indexURL string) ([]protocol.PeerInfo, error) {
-	wruntime.LogInfof(a.ctx, "[peer] Querying index server: %s", indexURL)
+// FetchNetworkFiles retrieves a list of all available file metadata from the index server.
+func (a *App) FetchNetworkFiles() ([]protocol.FileMeta, error) {
+	wruntime.LogInfof(a.ctx, "[peer] Fetching available files from index server")
 	if a.corePeer == nil { // Should be initialized in startup, but just in case
 		return nil, fmt.Errorf("CorePeer not initialized")
 	}
 
-	peers, err := a.corePeer.QueryPeersFromIndex(indexURL)
+	// Call the FetchFilesFromIndex method on the corePeer instance
+	files, err := a.corePeer.FetchFilesFromIndex(a.ctx)
 	if err != nil {
-		wruntime.LogErrorf(a.ctx, "[peer] Failed to query index server: %v", err)
-		return nil, fmt.Errorf("failed to query index: %w", err)
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to fetch files from index server: %v", err)
+		return nil, fmt.Errorf("failed to fetch files from index: %w", err)
 	}
-	wruntime.LogInfof(a.ctx, "[peer] Successfully queried index server: found %d peers", len(peers))
+	wruntime.LogInfof(a.ctx, "[peer] Successfully fetched files from index server: found %d files", len(files))
+	return files, nil
+}
+
+func (a *App) FetchPeersForFile(checksum string) ([]netip.AddrPort, error) {
+	wruntime.LogInfof(a.ctx, "[peer] Fetching peers for file with checksum: %s", checksum)
+	if a.corePeer == nil { // Should be initialized in startup, but just in case
+		return nil, fmt.Errorf("CorePeer not initialized")
+	}
+
+	peers, err := a.corePeer.QueryPeersForFile(a.ctx, checksum)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to fetch peers for file %s: %v", checksum, err)
+		return nil, fmt.Errorf("failed to fetch peers for file %s: %w", checksum, err)
+	}
+
+	wruntime.LogInfof(a.ctx, "[peer] Successfully fetched %d peers for file with checksum: %s", len(peers), checksum)
 	return peers, nil
 }
 
 func (a *App) DownloadFileWithDialog(
-	peerIP string,
-	peerPort uint16,
+	peerAddrPort netip.AddrPort,
 	fileChecksum, fileName string,
 ) (string, error) {
 	saveDir, err := wruntime.SaveFileDialog(a.ctx, wruntime.SaveDialogOptions{
@@ -177,16 +192,17 @@ func (a *App) DownloadFileWithDialog(
 	}
 	if saveDir == "" {
 		wruntime.LogInfo(a.ctx, "[peer] Save cancelled by user.")
-		return "Save cancelled by user.", nil // Or specific error
+		return "Save cancelled by user.", nil
 	}
 
 	wruntime.LogInfof(a.ctx, "[peer] Attempting to download file %s (checksum: %s) from %s:%d to %s",
-		fileName, fileChecksum, peerIP, peerPort, saveDir)
+		fileName, fileChecksum, peerAddrPort.Addr(), peerAddrPort.Port(), saveDir)
 
 	if a.corePeer == nil {
 		return "", fmt.Errorf("CorePeer not initialized")
 	}
-	err = a.corePeer.DownloadFileFromPeer(peerIP, peerPort, fileChecksum, fileName, saveDir)
+
+	err = a.corePeer.DownloadFileFromPeer(peerAddrPort, fileChecksum, fileName, saveDir)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file: %v", err)
 		return "", err

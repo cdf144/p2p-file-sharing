@@ -6,13 +6,13 @@ const props = defineProps<{
     isQuerying: boolean;
     queryError: string;
     lastQueryTime: Date | null;
-    availablePeers: protocol.PeerInfo[];
+    networkFiles: protocol.FileMeta[];
     allNetworkFilesCount: number;
 }>();
 
 const emit = defineEmits(['discover-peers']);
 
-const availablePeersCount = computed(() => props.availablePeers.length);
+const networkFilesCount = computed(() => props.networkFiles.length);
 
 function discoverPeers() {
     emit('discover-peers');
@@ -39,8 +39,8 @@ function discoverPeers() {
 
         <div v-if="lastQueryTime" class="text-sm text-gray-400">Last updated: {{ lastQueryTime.toLocaleString() }}</div>
 
-        <div v-if="availablePeersCount > 0" class="text-sm text-gray-300">
-            Found {{ availablePeersCount }} peer(s) sharing {{ allNetworkFilesCount }} file(s)
+        <div v-if="networkFilesCount > 0" class="text-sm text-gray-300">
+            Found {{ networkFilesCount }} peer(s) sharing {{ allNetworkFilesCount }} file(s)
         </div>
         <div v-else-if="lastQueryTime" class="text-sm text-gray-300">No peers found on the index server.</div>
     </div>

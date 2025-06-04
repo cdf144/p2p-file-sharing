@@ -134,15 +134,15 @@ watch(filesPerPage, () => {
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-600 bg-gray-700">
-                    <tr v-for="file in paginatedFiles" :key="file.Checksum">
+                    <tr v-for="file in paginatedFiles" :key="file.checksum">
                         <td class="px-6 py-4 text-left text-sm font-medium whitespace-nowrap text-gray-200">
-                            {{ file.Name }}
+                            {{ file.name }}
                         </td>
                         <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
-                            {{ formatFileSize(file.Size) }}
+                            {{ formatFileSize(file.size) }}
                         </td>
-                        <td class="truncate px-6 py-4 text-left text-sm text-gray-300" :title="file.Checksum">
-                            {{ file.Checksum }}
+                        <td class="truncate px-6 py-4 text-left text-sm text-gray-300" :title="file.checksum">
+                            {{ file.checksum }}
                         </td>
                     </tr>
                 </tbody>

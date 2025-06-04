@@ -1,9 +1,26 @@
+export namespace netip {
+	
+	export class AddrPort {
+	
+	
+	    static createFrom(source: any = {}) {
+	        return new AddrPort(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	
+	    }
+	}
+
+}
+
 export namespace protocol {
 	
 	export class FileMeta {
-	    Checksum: string;
-	    Name: string;
-	    Size: number;
+	    checksum: string;
+	    name: string;
+	    size: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new FileMeta(source);
@@ -11,15 +28,14 @@ export namespace protocol {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.Checksum = source["Checksum"];
-	        this.Name = source["Name"];
-	        this.Size = source["Size"];
+	        this.checksum = source["checksum"];
+	        this.name = source["name"];
+	        this.size = source["size"];
 	    }
 	}
 	export class PeerInfo {
-	    IP: number[];
-	    Port: number;
-	    Files: FileMeta[];
+	    address: string;
+	    files: FileMeta[];
 	
 	    static createFrom(source: any = {}) {
 	        return new PeerInfo(source);
@@ -27,9 +43,8 @@ export namespace protocol {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.IP = source["IP"];
-	        this.Port = source["Port"];
-	        this.Files = this.convertValues(source["Files"], FileMeta);
+	        this.address = source["address"];
+	        this.files = this.convertValues(source["files"], FileMeta);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

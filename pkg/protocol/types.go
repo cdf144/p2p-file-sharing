@@ -3,24 +3,51 @@ package protocol
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"net"
+	"net/netip"
 )
 
 // PeerInfo represents information about a peer in the P2P network,
-// including its network address and the files it shares.
+// including its network address and a list of files it shares.
 type PeerInfo struct {
-	IP    net.IP
-	Port  uint16
-	Files []FileMeta
+	Address netip.AddrPort `json:"address" ts_type:"string"`
+	Files   []FileMeta     `json:"files"`
+}
+
+// PeerInfoSummary provides a summary of a peer's information,
+// including its network address and the count of files it shares.
+// This is useful for quickly listing peers without exposing their file details.
+type PeerInfoSummary struct {
+	Address   netip.AddrPort `json:"address" ts_type:"string"`
+	FileCount int            `json:"fileCount"`
 }
 
 // FileMeta represents the metadata of a file shared by a peer in the P2P network.
 // It includes the checksum for integrity verification,
 // the name of the file, and its size in bytes.
 type FileMeta struct {
-	Checksum string
-	Name     string
-	Size     int64
+	Checksum string `json:"checksum"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+}
+
+// MessageType represents the different types of messages in the P2P protocol
+type MessageType uint8
+
+const (
+	FILE_REQUEST MessageType = iota
+	FILE_DATA
+)
+
+// String returns the string representation of the MessageType
+func (mt MessageType) String() string {
+	switch mt {
+	case FILE_REQUEST:
+		return "FILE_REQUEST"
+	case FILE_DATA:
+		return "FILE_DATA"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 // GenerateChecksum calculates the SHA256 checksum of the given file data
