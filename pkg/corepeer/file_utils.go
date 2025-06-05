@@ -23,7 +23,11 @@ type LocalFileInfo struct {
 
 // ScanDirectory scans a directory for files and computes their metadata.
 // It takes a context for potential cancellation if scanning is long.
-func ScanDirectory(ctx context.Context, dir string, logger *log.Logger) ([]protocol.FileMeta, error) {
+// It returns []protocol.FileMeta for announcements/display,
+// a map[checksum]fullFilePath for local lookups, and an error.
+func ScanDirectory(
+	ctx context.Context, dir string, logger *log.Logger,
+) ([]protocol.FileMeta, map[string]string, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -34,7 +38,11 @@ func ScanDirectory(ctx context.Context, dir string, logger *log.Logger) ([]proto
 	}
 
 	jobs := make(chan string)
-	jobResults := make(chan protocol.FileMeta)
+	type scanResult struct {
+		meta protocol.FileMeta
+		path string
+	}
+	jobResults := make(chan scanResult)
 	var wg sync.WaitGroup
 
 	for i := range numWorkers {
@@ -71,10 +79,13 @@ func ScanDirectory(ctx context.Context, dir string, logger *log.Logger) ([]proto
 					}
 
 					select {
-					case jobResults <- protocol.FileMeta{
-						Checksum: checksum,
-						Name:     info.Name(),
-						Size:     info.Size(),
+					case jobResults <- scanResult{
+						meta: protocol.FileMeta{
+							Checksum: checksum,
+							Name:     info.Name(),
+							Size:     info.Size(),
+						},
+						path: path,
 					}:
 						// Successfully sent result to jobResults channel
 					case <-ctx.Done():
@@ -123,26 +134,24 @@ func ScanDirectory(ctx context.Context, dir string, logger *log.Logger) ([]proto
 		close(jobResults)
 	}()
 
-	scannedFiles := make([]protocol.FileMeta, 0)
-	for file := range jobResults {
-		scannedFiles = append(scannedFiles, file)
+	scannedFileMetas := make([]protocol.FileMeta, 0)
+	scannedFilePaths := make(map[string]string)
+	for res := range jobResults {
+		scannedFileMetas = append(scannedFileMetas, res.meta)
+		scannedFilePaths[res.meta.Checksum] = res.path
 	}
 
 	if walkErr != nil && walkErr != context.Canceled && walkErr != context.DeadlineExceeded {
-		return scannedFiles, walkErr
+		return scannedFileMetas, scannedFilePaths, walkErr
 	}
 	if ctx.Err() != nil {
-		return scannedFiles, ctx.Err()
+		return scannedFileMetas, scannedFilePaths, ctx.Err()
 	}
-
-	return scannedFiles, nil
+	return scannedFileMetas, scannedFilePaths, nil
 }
 
 // FindSharedFileByChecksum searches for a file by its checksum in the shared directory.
 func FindSharedFileByChecksum(shareDir, checksum string, logger *log.Logger) (*LocalFileInfo, error) {
-	// PERF: This function is not efficient for large directories as it reads every file.
-	// A more efficient implementation would use a map of checksums to paths
-	// populated during an initial scan or maintained by the CorePeer.
 	if logger == nil {
 		logger = log.Default()
 	}

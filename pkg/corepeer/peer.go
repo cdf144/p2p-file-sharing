@@ -23,6 +23,9 @@ import (
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
 )
 
+// TODO: Implement downloading files in chunks from multiple peers, with progress reporting and connections tracking.
+// TODO: Implement optional secure connections (TLS) for file transfers.
+
 // CorePeerConfig holds configuration for the CorePeer.
 type CorePeerConfig struct {
 	IndexURL   string
@@ -33,15 +36,16 @@ type CorePeerConfig struct {
 
 // CorePeer manages the core P2P logic.
 type CorePeer struct {
-	config        CorePeerConfig
-	isServing     bool
-	servePort     uint16
-	serveCtx      context.Context    // Own context for managing internal serving lifecycle
-	serveCancel   context.CancelFunc // Function to cancel serveCtx
-	sharedFiles   []protocol.FileMeta
-	announcedAddr netip.AddrPort
-	mu            sync.RWMutex
-	logger        *log.Logger
+	config          CorePeerConfig
+	isServing       bool
+	servePort       uint16
+	serveCtx        context.Context    // Own context for managing internal serving lifecycle
+	serveCancel     context.CancelFunc // Function to cancel serveCtx
+	sharedFiles     []protocol.FileMeta
+	sharedFilePaths map[string]string // map[checksum]fullFilePath for quick local lookups
+	announcedAddr   netip.AddrPort
+	mu              sync.RWMutex
+	logger          *log.Logger
 }
 
 // NewCorePeer creates a new CorePeer instance.
@@ -68,27 +72,34 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	var err error
 	// 1. Scan files
 	if p.config.ShareDir != "" {
+		p.mu.Lock()
 		absShareDir, err := filepath.Abs(p.config.ShareDir)
 		if err != nil {
+			p.mu.Unlock()
 			return "", fmt.Errorf("failed to get absolute path for share directory %s: %w", p.config.ShareDir, err)
 		}
 		p.config.ShareDir = absShareDir
 
 		p.logger.Printf("Scanning directory: %s", p.config.ShareDir)
-		p.sharedFiles, err = ScanDirectory(ctx, p.config.ShareDir, p.logger)
+		scannedFiles, scannedPaths, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
 		if err != nil {
 			p.logger.Printf(
 				"Warning: Failed to scan share directory %s: %v. No files will be shared.",
 				p.config.ShareDir, err,
 			)
 			p.sharedFiles = []protocol.FileMeta{}
+			p.sharedFilePaths = make(map[string]string)
 		} else {
+			p.sharedFiles = scannedFiles
+			p.sharedFilePaths = scannedPaths
 			p.logger.Printf("Scanned %d files from %s", len(p.sharedFiles), p.config.ShareDir)
 		}
 	} else {
 		p.logger.Println("No share directory specified. No files will be shared.")
 		p.sharedFiles = []protocol.FileMeta{}
+		p.sharedFilePaths = make(map[string]string)
 	}
+	p.mu.Unlock()
 
 	// 2. Determine IP address
 	announceIP, err := DetermineMachineIP()
@@ -242,6 +253,10 @@ func (p *CorePeer) SetSharedDirectory(ctx context.Context, shareDir string) erro
 	if shareDir == "" {
 		p.logger.Println("Clearing shared directory.")
 		p.sharedFiles = []protocol.FileMeta{}
+		p.sharedFilePaths = make(map[string]string)
+		if p.isServing {
+			go p.reannounce(context.Background())
+		}
 		return nil
 	}
 
@@ -252,13 +267,19 @@ func (p *CorePeer) SetSharedDirectory(ctx context.Context, shareDir string) erro
 	p.config.ShareDir = absShareDir
 
 	p.logger.Printf("Setting new share directory: %s", p.config.ShareDir)
-	files, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
-	if err != nil {
-		return fmt.Errorf("failed to scan new share directory %s: %w", p.config.ShareDir, err)
+	scannedFiles, scannedPaths, scanErr := ScanDirectory(ctx, p.config.ShareDir, p.logger)
+	if scanErr != nil {
+		p.sharedFiles = []protocol.FileMeta{}
+		p.sharedFilePaths = make(map[string]string)
+		return fmt.Errorf("failed to scan new share directory %s: %w", p.config.ShareDir, scanErr)
 	}
-	p.sharedFiles = files
+	p.sharedFiles = scannedFiles
+	p.sharedFilePaths = scannedPaths
 	p.logger.Printf("Updated shared files: %d files found.", len(p.sharedFiles))
 
+	if p.isServing {
+		go p.reannounce(context.Background())
+	}
 	return nil
 }
 
@@ -435,23 +456,32 @@ func (p *CorePeer) UpdateSharedFiles(ctx context.Context) error {
 	if p.config.ShareDir == "" {
 		p.logger.Println("No share directory configured, cannot update shared files.")
 		p.sharedFiles = []protocol.FileMeta{}
+		p.sharedFilePaths = make(map[string]string)
+		if p.isServing {
+			go p.reannounce(context.Background())
+		}
 		return nil
 	}
 
 	p.logger.Printf("Re-scanning directory: %s", p.config.ShareDir)
-	newFiles, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
+	newFiles, newFilePaths, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
 	if err != nil {
 		p.logger.Printf("Error re-scanning directory %s: %v", p.config.ShareDir, err)
+		p.sharedFiles = []protocol.FileMeta{}
+		p.sharedFilePaths = make(map[string]string)
 		return fmt.Errorf("failed to re-scan directory: %w", err)
 	}
 	p.sharedFiles = newFiles
+	p.sharedFilePaths = newFilePaths
 	p.logger.Printf("Updated shared files: %d files found.", len(p.sharedFiles))
 
-	if err := p.reannounce(ctx); err != nil {
-		p.logger.Printf("Warning: Failed to re-announce after updating shared files: %v", err)
-		return fmt.Errorf("failed to re-announce after updating shared files: %w", err)
+	if p.isServing {
+		if err := p.reannounce(ctx); err != nil {
+			p.logger.Printf("Failed to re-announce after updating shared files: %v", err)
+			return fmt.Errorf("failed to re-announce after updating shared files: %w", err)
+		}
+		p.logger.Println("Successfully re-announced to index server after updating shared files.")
 	}
-	p.logger.Println("Successfully re-announced to index server after updating shared files.")
 	return nil
 }
 
@@ -583,12 +613,12 @@ func (p *CorePeer) serveFiles(ctx context.Context, shareDir string) {
 				continue
 			}
 		}
-		go p.handleFileRequest(conn, shareDir)
+		go p.handleFileRequest(conn)
 	}
 }
 
 // handleFileRequest processes an incoming file request.
-func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
+func (p *CorePeer) handleFileRequest(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
@@ -601,32 +631,15 @@ func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
 
 	request = strings.TrimSpace(request)
 	p.logger.Printf("Received request from %s: %s", conn.RemoteAddr(), request)
-
 	if !strings.HasPrefix(request, protocol.FILE_REQUEST.String()+" ") {
 		conn.Write(fmt.Appendf(nil, "%s Invalid request format\n", protocol.ERROR.String()))
 		return
 	}
+	checksum := strings.TrimSpace(strings.TrimPrefix(request, protocol.FILE_REQUEST.String()+" "))
 
-	checksum := strings.TrimPrefix(request, protocol.FILE_REQUEST.String()+" ")
-	checksum = strings.TrimSpace(checksum)
-
-	// NOTE: The current FindSharedFileByChecksum re-scans, which is not ideal here.
-	// TODO: A better approach: CorePeer maintains an index (map[checksum]LocalFileInfo).
-	var localFile *LocalFileInfo
-	p.mu.RLock()
-	for _, meta := range p.sharedFiles {
-		if meta.Checksum == checksum {
-			lFile, findErr := FindSharedFileByChecksum(shareDir, checksum, p.logger)
-			if findErr == nil {
-				localFile = lFile
-			}
-			break
-		}
-	}
-	p.mu.RUnlock()
-
-	if localFile == nil {
-		p.logger.Printf("File not found for checksum %s requested by %s", checksum, conn.RemoteAddr())
+	localFile, err := p.getLocalFileInfoByChecksum(checksum)
+	if err != nil {
+		p.logger.Printf("File not found for checksum %s requested by %s: %v", checksum, conn.RemoteAddr(), err)
 		conn.Write(fmt.Appendf(nil, "%s File not found for checksum %s\n", protocol.ERROR.String(), checksum))
 		return
 	}
@@ -655,4 +668,28 @@ func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
 	}
 
 	p.logger.Printf("Successfully sent file %s (%d bytes) to %s", localFile.Name, sent, conn.RemoteAddr())
+}
+
+func (p *CorePeer) getLocalFileInfoByChecksum(checksum string) (*LocalFileInfo, error) {
+	p.mu.RLock()
+	filePath, ok := p.sharedFilePaths[checksum]
+	p.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("file with checksum %s not found in shared files index", checksum)
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		p.logger.Printf("Error stating file %s (checksum %s): %v. File might be missing.", filePath, checksum, err)
+		// NOTE: Trigger a re-scan (or remove from index) here or not?
+		return nil, fmt.Errorf("file path %s (checksum %s) found in index but failed to stat: %w", filePath, checksum, err)
+	}
+
+	return &LocalFileInfo{
+		Checksum: checksum,
+		Path:     filePath,
+		Name:     info.Name(),
+		Size:     info.Size(),
+	}, nil
 }

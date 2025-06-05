@@ -15,6 +15,7 @@ import (
 )
 
 // TODO: replace IndexServer with a persistent storage solution, i.e., a database.
+// FIXME: Files of different names can have the same checksum, so we need to handle that.
 
 // IndexServer is a temporary in-memory index server that stores file metadata.
 type IndexServer struct {
