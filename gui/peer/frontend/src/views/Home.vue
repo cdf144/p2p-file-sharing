@@ -7,6 +7,7 @@ import {
     SelectShareDirectory,
     StartPeerLogic,
     StopPeerLogic,
+    UpdatePeerConfig,
 } from '../../wailsjs/go/main/App';
 import { protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
@@ -100,6 +101,14 @@ function updatePeerConfig(newConfig: typeof peerConfig) {
     peerConfig.indexURL = newConfig.indexURL;
     peerConfig.servePort = newConfig.servePort;
     peerConfig.publicPort = newConfig.publicPort;
+    UpdatePeerConfig(
+        peerConfig.indexURL,
+        peerConfig.shareDir,
+        Number(peerConfig.servePort),
+        Number(peerConfig.publicPort),
+    ).catch((error: any) => {
+        LogError(`Error updating peer config: ${error}`);
+    });
 }
 
 async function queryNetwork() {

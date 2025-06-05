@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,9 +18,9 @@ import (
 
 // IndexServer is a temporary in-memory index server that stores file metadata.
 type IndexServer struct {
-	mu       sync.RWMutex
 	files    map[string][]protocol.PeerInfo // Maps file Checksum to a list of PeerInfo
 	fileInfo map[string]protocol.FileMeta   // Maps file Checksum to file metadata
+	mu       sync.RWMutex
 	logger   *log.Logger
 }
 
@@ -81,7 +80,8 @@ func (s *IndexServer) PeersHandler(w http.ResponseWriter, r *http.Request) {
 			s.handlePostPeerAnnounce(w, r)
 		case "/peers/deannounce":
 			s.handlePostPeerDeannounce(w, r)
-		// TODO: Add a POST endpoint for peer reannouncement
+		case "/peers/reannounce":
+			s.handlePostPeerReannounce(w, r)
 		default:
 			http.Error(w, "not found", http.StatusNotFound)
 			s.logger.Printf("Could not handle request: %s %s", r.Method, r.URL.Path)
@@ -156,73 +156,134 @@ func (s *IndexServer) handleGetOnePeerFiles(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *IndexServer) handlePostPeerAnnounce(w http.ResponseWriter, r *http.Request) {
-	var peer protocol.PeerInfo
-	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
-		http.Error(w, "invalid JSON request body", http.StatusBadRequest)
+	var peerToAnnounce protocol.PeerInfo
+	if err := json.NewDecoder(r.Body).Decode(&peerToAnnounce); err != nil {
+		http.Error(w, "invalid JSON request body for announce", http.StatusBadRequest)
+		s.logger.Printf("Error decoding announce request: %v", err)
 		return
 	}
 
-	if !peer.Address.IsValid() {
+	if !peerToAnnounce.Address.IsValid() {
 		http.Error(w, "invalid announce address", http.StatusBadRequest)
-		s.logger.Printf("Invalid announce address: %s", peer.Address)
+		s.logger.Printf("Invalid announce address: %s", peerToAnnounce.Address.String())
 		return
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, file := range peer.Files {
-		s.files[file.Checksum] = append(s.files[file.Checksum], peer)
-		if _, ok := s.fileInfo[file.Checksum]; !ok {
-			s.fileInfo[file.Checksum] = file
-		}
-	}
+	s.upsertPeerAssociations(peerToAnnounce)
+	s.mu.Unlock()
+
 	s.logger.Printf(
-		"[index-server] Registered peer %s:%d with %d files",
-		peer.Address.Addr(), peer.Address.Port(), len(peer.Files),
+		"Peer %s announced/updated with %d files.",
+		peerToAnnounce.Address.String(), len(peerToAnnounce.Files),
 	)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *IndexServer) handlePostPeerDeannounce(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Address string `json:"address"`
+	var peerToDeannounce struct {
+		// For manual API testing, supply "address" as a string in the format "<ip>:<port>"
+		Address netip.AddrPort `json:"address"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON request body", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&peerToDeannounce); err != nil {
+		http.Error(w, "invalid JSON request body for deannounce", http.StatusBadRequest)
 		return
 	}
 
-	peerAddr, err := netip.ParseAddrPort(req.Address)
-	if err != nil {
-		http.Error(w, "invalid deannounce address format", http.StatusBadRequest)
-		s.logger.Printf("Invalid deannounce address format: %v", err)
+	if !peerToDeannounce.Address.IsValid() {
+		http.Error(w, "invalid deannounce address", http.StatusBadRequest)
+		s.logger.Printf("Invalid deannounce address: %s", peerToDeannounce.Address.String())
 		return
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	removedFileCount := len(s.removePeerAssociations(peerToDeannounce.Address))
+	s.mu.Unlock()
 
-	filesToDelete := make([]string, 0)
-	for checksum, peers := range s.files {
-		for i, peer := range peers {
-			if peer.Address == peerAddr {
-				s.files[checksum] = slices.Delete(peers, i, i+1)
+	s.logger.Printf(
+		"Peer %s deannounced. %d unique files removed from index as a result.",
+		peerToDeannounce.Address.String(), removedFileCount,
+	)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *IndexServer) handlePostPeerReannounce(w http.ResponseWriter, r *http.Request) {
+	var peerToUpdate protocol.PeerInfo
+	if err := json.NewDecoder(r.Body).Decode(&peerToUpdate); err != nil {
+		http.Error(w, "invalid JSON request body for reannounce", http.StatusBadRequest)
+		s.logger.Printf("Error decoding reannounce request: %v", err)
+		return
+	}
+
+	if !peerToUpdate.Address.IsValid() {
+		http.Error(w, "invalid reannounce address", http.StatusBadRequest)
+		s.logger.Printf("Invalid reannounce address: %s", peerToUpdate.Address.String())
+		return
+	}
+
+	s.mu.Lock()
+	s.removePeerAssociations(peerToUpdate.Address)
+	s.upsertPeerAssociations(peerToUpdate)
+	s.mu.Unlock()
+
+	s.logger.Printf(
+		"Peer %s re-announced with %d files.",
+		peerToUpdate.Address.String(), len(peerToUpdate.Files),
+	)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// upsertPeerAssociations adds/updates a peer's presence and its shared files.
+// Assumes s.mu is already locked.
+func (s *IndexServer) upsertPeerAssociations(peerInfo protocol.PeerInfo) {
+	peerAddr := peerInfo.Address
+	for _, file := range peerInfo.Files {
+		s.fileInfo[file.Checksum] = file
+
+		currentPeersForFile := s.files[file.Checksum]
+		exist := false
+		for i, currentPeer := range currentPeersForFile {
+			if currentPeer.Address == peerAddr {
+				exist = true
+				currentPeersForFile[i] = peerInfo
 				break
 			}
 		}
-		if len(s.files[checksum]) == 0 {
-			filesToDelete = append(filesToDelete, checksum)
+		if !exist {
+			currentPeersForFile = append(currentPeersForFile, peerInfo)
+		}
+		s.files[file.Checksum] = currentPeersForFile
+	}
+}
+
+// removePeerAssociations removes all records of a peer and its files.
+// It returns a list of checksums for files that were completely removed from the index
+// (i.e., no other peer was sharing them and their metadata was deleted).
+// Assumes s.mu is already locked.
+func (s *IndexServer) removePeerAssociations(peerAddr netip.AddrPort) (removedFileChecksums []string) {
+	for checksum, currentPeersForFile := range s.files {
+		updatedPeersForFile := make([]protocol.PeerInfo, 0, len(currentPeersForFile))
+		peerWasPresent := false
+
+		for _, p := range currentPeersForFile {
+			if p.Address != peerAddr {
+				updatedPeersForFile = append(updatedPeersForFile, p)
+			} else {
+				peerWasPresent = true
+			}
+		}
+
+		if peerWasPresent {
+			if len(updatedPeersForFile) == 0 {
+				delete(s.files, checksum)
+				delete(s.fileInfo, checksum)
+				removedFileChecksums = append(removedFileChecksums, checksum)
+			} else {
+				s.files[checksum] = updatedPeersForFile
+			}
 		}
 	}
-
-	for _, checksum := range filesToDelete {
-		delete(s.files, checksum)
-		delete(s.fileInfo, checksum)
-	}
-
-	s.logger.Printf(
-		"[index-server] Deannounced peer %s:%d, removed %d files",
-		peerAddr.Addr(), peerAddr.Port(), len(filesToDelete),
-	)
+	return removedFileChecksums
 }
 
 func (s *IndexServer) FilesHandler(w http.ResponseWriter, r *http.Request) {

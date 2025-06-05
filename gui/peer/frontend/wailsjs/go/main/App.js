@@ -33,3 +33,7 @@ export function StartPeerLogic(arg1, arg2, arg3, arg4) {
 export function StopPeerLogic() {
   return window['go']['main']['App']['StopPeerLogic']();
 }
+
+export function UpdatePeerConfig(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['UpdatePeerConfig'](arg1, arg2, arg3, arg4);
+}

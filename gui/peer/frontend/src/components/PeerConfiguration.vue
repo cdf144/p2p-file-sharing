@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { reactive } from 'vue';
+import { reactive, ref } from 'vue';
 
 const props = defineProps<{
     initialConfig: {
@@ -15,9 +15,16 @@ const props = defineProps<{
 const emit = defineEmits(['update:config', 'toggle-start-stop-peer', 'select-directory']);
 
 const localConfig = reactive({ ...props.initialConfig });
+// Add delay for input changes to avoid excessive updates
+const debounceTimer = ref<NodeJS.Timeout | null>(null);
 
 function handleInput() {
-    emit('update:config', { ...localConfig });
+    if (debounceTimer.value) {
+        clearTimeout(debounceTimer.value);
+    }
+    debounceTimer.value = setTimeout(() => {
+        emit('update:config', { ...localConfig });
+    }, 1000);
 }
 
 function selectDirectory() {
@@ -59,7 +66,7 @@ function toggleStartStopPeer() {
             <button
                 @click="selectDirectory"
                 class="focus:ring-opacity-50 rounded-md bg-blue-600 px-4 py-2 font-semibold text-white shadow hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:opacity-50"
-                :disabled="isServing || isLoading"
+                :disabled="isLoading"
             >
                 Select Directory
             </button>

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"path/filepath"
 
 	"github.com/cdf144/p2p-file-sharing/pkg/corepeer"
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
@@ -83,29 +82,45 @@ func (a *App) SelectShareDirectory() (string, error) {
 	return dir, nil
 }
 
+func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort int) (string, error) {
+	if a.corePeer == nil {
+		return "", fmt.Errorf("CorePeer not initialized")
+	}
+
+	newConfig := corepeer.CorePeerConfig{
+		IndexURL:   indexURL,
+		ShareDir:   shareDir,
+		ServePort:  servePort,
+		PublicPort: publicPort,
+	}
+
+	if err := a.corePeer.UpdateConfig(a.ctx, newConfig); err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
+		return "", fmt.Errorf("failed to update CorePeer config: %w", err)
+	}
+
+	wruntime.LogInfof(
+		a.ctx,
+		"[peer] Updated CorePeer config with IndexURL: %s, ShareDir: %s, ServePort: %d, PublicPort: %d",
+		indexURL, shareDir, servePort, publicPort,
+	)
+
+	return "CorePeer configuration updated successfully", nil
+}
+
 func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort int) (string, error) {
 	if a.corePeer.IsServing() {
 		return "Peer is already running", nil
 	}
 
-	absShareDir := ""
-	if shareDir != "" {
-		var err error
-		absShareDir, err = filepath.Abs(shareDir)
-		if err != nil {
-			wruntime.LogErrorf(a.ctx, "[peer] Failed to get absolute path for share directory %s: %v", shareDir, err)
-			return "", fmt.Errorf("failed to get absolute path for share directory %s: %w", shareDir, err)
-		}
-	}
-
-	newConfig := corepeer.CorePeerConfig{
+	config := corepeer.CorePeerConfig{
 		IndexURL:   indexURL,
-		ShareDir:   absShareDir,
+		ShareDir:   shareDir,
 		ServePort:  servePort,
 		PublicPort: publicPort,
 	}
 
-	if err := a.corePeer.UpdateConfig(newConfig); err != nil {
+	if err := a.corePeer.UpdateConfig(a.ctx, config); err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
 		return "", fmt.Errorf("failed to update CorePeer config: %w", err)
 	}
@@ -113,7 +128,7 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 	wruntime.LogInfof(
 		a.ctx,
 		"[peer] Starting CorePeer with IndexURL: %s, ShareDir: %s, ServePort: %d, PublicPort: %d",
-		indexURL, absShareDir, servePort, publicPort,
+		indexURL, shareDir, servePort, publicPort,
 	)
 
 	statusMsg, err := a.corePeer.Start(a.ctx)
