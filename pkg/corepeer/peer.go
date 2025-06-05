@@ -354,7 +354,7 @@ func (p *CorePeer) DownloadFileFromPeer(
 	}
 	defer conn.Close()
 
-	_, err = conn.Write(fmt.Appendf(nil, "FILE_REQUEST %s\n", fileChecksum))
+	_, err = conn.Write(fmt.Appendf(nil, "%s %s\n", protocol.FILE_REQUEST.String(), fileChecksum))
 	if err != nil {
 		return fmt.Errorf("failed to send request to peer: %w", err)
 	}
@@ -368,14 +368,14 @@ func (p *CorePeer) DownloadFileFromPeer(
 	}
 
 	response = strings.TrimSpace(response)
-	if strings.HasPrefix(response, "ERROR ") {
-		return fmt.Errorf("peer error: %s", strings.TrimPrefix(response, "ERROR "))
+	if strings.HasPrefix(response, protocol.ERROR.String()+" ") {
+		return fmt.Errorf("peer error: %s", strings.TrimPrefix(response, protocol.ERROR.String()+" "))
 	}
-	if !strings.HasPrefix(response, "FILE_DATA ") {
+	if !strings.HasPrefix(response, protocol.FILE_DATA.String()+" ") {
 		return fmt.Errorf("unexpected response from peer: %s", response)
 	}
 
-	fileSizeStr := strings.TrimPrefix(response, "FILE_DATA ")
+	fileSizeStr := strings.TrimPrefix(response, protocol.FILE_DATA.String()+" ")
 	fileSize, err := strconv.ParseInt(fileSizeStr, 10, 64)
 	if err != nil {
 		return fmt.Errorf("invalid file size in response '%s': %w", fileSizeStr, err)
@@ -602,13 +602,12 @@ func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
 	request = strings.TrimSpace(request)
 	p.logger.Printf("Received request from %s: %s", conn.RemoteAddr(), request)
 
-	fileReqMessage := fmt.Sprintf("%s ", protocol.FILE_REQUEST)
-	if !strings.HasPrefix(request, fileReqMessage) {
-		conn.Write([]byte("ERROR invalid request format\n"))
+	if !strings.HasPrefix(request, protocol.FILE_REQUEST.String()+" ") {
+		conn.Write(fmt.Appendf(nil, "%s Invalid request format\n", protocol.ERROR.String()))
 		return
 	}
 
-	checksum := strings.TrimPrefix(request, fileReqMessage)
+	checksum := strings.TrimPrefix(request, protocol.FILE_REQUEST.String()+" ")
 	checksum = strings.TrimSpace(checksum)
 
 	// NOTE: The current FindSharedFileByChecksum re-scans, which is not ideal here.
@@ -628,14 +627,14 @@ func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
 
 	if localFile == nil {
 		p.logger.Printf("File not found for checksum %s requested by %s", checksum, conn.RemoteAddr())
-		conn.Write(fmt.Appendf(nil, "ERROR File not found: %s\n", checksum))
+		conn.Write(fmt.Appendf(nil, "%s File not found for checksum %s\n", protocol.ERROR.String(), checksum))
 		return
 	}
 
 	// NOTE: Arbitrary timeout for file transfer.
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 
-	_, err = conn.Write(fmt.Appendf(nil, "FILE_DATA %d\n", localFile.Size))
+	_, err = conn.Write(fmt.Appendf(nil, "%s %d\n", protocol.FILE_DATA.String(), localFile.Size))
 	if err != nil {
 		p.logger.Printf("Failed to send file data header to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
 		return
@@ -644,7 +643,7 @@ func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
 	fileHandle, err := os.Open(localFile.Path)
 	if err != nil {
 		p.logger.Printf("Failed to open file %s: %v", localFile.Path, err)
-		conn.Write([]byte("ERROR Failed to access file\n"))
+		conn.Write(fmt.Appendf(nil, "%s Failed to open file\n", protocol.ERROR))
 		return
 	}
 	defer fileHandle.Close()

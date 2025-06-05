@@ -36,6 +36,7 @@ type MessageType uint8
 const (
 	FILE_REQUEST MessageType = iota
 	FILE_DATA
+	ERROR
 )
 
 // String returns the string representation of the MessageType
@@ -45,6 +46,8 @@ func (mt MessageType) String() string {
 		return "FILE_REQUEST"
 	case FILE_DATA:
 		return "FILE_DATA"
+	case ERROR:
+		return "ERROR"
 	default:
 		return "UNKNOWN"
 	}
