@@ -75,7 +75,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 		p.config.ShareDir = absShareDir
 
 		p.logger.Printf("Scanning directory: %s", p.config.ShareDir)
-		p.sharedFiles, err = ScanDirectory(ctx, p.config.ShareDir)
+		p.sharedFiles, err = ScanDirectory(ctx, p.config.ShareDir, p.logger)
 		if err != nil {
 			p.logger.Printf(
 				"Warning: Failed to scan share directory %s: %v. No files will be shared.",
@@ -252,7 +252,7 @@ func (p *CorePeer) SetSharedDirectory(ctx context.Context, shareDir string) erro
 	p.config.ShareDir = absShareDir
 
 	p.logger.Printf("Setting new share directory: %s", p.config.ShareDir)
-	files, err := ScanDirectory(ctx, p.config.ShareDir)
+	files, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
 	if err != nil {
 		return fmt.Errorf("failed to scan new share directory %s: %w", p.config.ShareDir, err)
 	}
@@ -439,7 +439,7 @@ func (p *CorePeer) UpdateSharedFiles(ctx context.Context) error {
 	}
 
 	p.logger.Printf("Re-scanning directory: %s", p.config.ShareDir)
-	newFiles, err := ScanDirectory(ctx, p.config.ShareDir)
+	newFiles, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
 	if err != nil {
 		p.logger.Printf("Error re-scanning directory %s: %v", p.config.ShareDir, err)
 		return fmt.Errorf("failed to re-scan directory: %w", err)
@@ -613,10 +613,10 @@ func (p *CorePeer) handleFileRequest(conn net.Conn, shareDir string) {
 	// NOTE: The current FindSharedFileByChecksum re-scans, which is not ideal here.
 	// TODO: A better approach: CorePeer maintains an index (map[checksum]LocalFileInfo).
 	var localFile *LocalFileInfo
-	p.mu.RLock() // Protect access to p.sharedFiles when iterating
+	p.mu.RLock()
 	for _, meta := range p.sharedFiles {
 		if meta.Checksum == checksum {
-			lFile, findErr := FindSharedFileByChecksum(shareDir, checksum)
+			lFile, findErr := FindSharedFileByChecksum(shareDir, checksum, p.logger)
 			if findErr == nil {
 				localFile = lFile
 			}

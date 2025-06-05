@@ -3,6 +3,7 @@ package protocol
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/netip"
 )
 
@@ -53,9 +54,11 @@ func (mt MessageType) String() string {
 	}
 }
 
-// GenerateChecksum calculates the SHA256 checksum of the given file data
-// and returns it as a hexadecimal encoded string.
-func GenerateChecksum(data []byte) string {
-	hash := sha256.Sum256(data)
-	return hex.EncodeToString(hash[:])
+// GenerateChecksum computes the SHA256 checksum from an io.Reader.
+func GenerateChecksum(r io.Reader) (string, error) {
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, r); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
