@@ -1,6 +1,8 @@
 <script lang="ts" setup>
 import { reactive, ref } from 'vue';
 
+const DEBOUNCE_DELAY = 300; // ms
+
 const props = defineProps<{
     initialConfig: {
         indexURL: string;
@@ -15,7 +17,7 @@ const props = defineProps<{
 const emit = defineEmits(['update:config', 'toggle-start-stop-peer', 'select-directory']);
 
 const localConfig = reactive({ ...props.initialConfig });
-// Add delay for input changes to avoid excessive updates
+// Delay for input changes to avoid excessive updates
 const debounceTimer = ref<NodeJS.Timeout | null>(null);
 
 function handleInput() {
@@ -24,7 +26,7 @@ function handleInput() {
     }
     debounceTimer.value = setTimeout(() => {
         emit('update:config', { ...localConfig });
-    }, 1000);
+    }, DEBOUNCE_DELAY);
 }
 
 function selectDirectory() {
