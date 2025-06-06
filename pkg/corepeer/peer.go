@@ -5,12 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -145,16 +143,13 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 }
 
 // Stop halts the peer's operations.
-func (p *CorePeer) Stop(ctx context.Context) {
+func (p *CorePeer) Stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if !p.isServing {
 		p.logger.Println("Peer is not running.")
 		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 
 	if err := p.indexClient.Deannounce(p.announcedAddr); err != nil {
@@ -228,79 +223,12 @@ func (p *CorePeer) GetSharedFiles() []protocol.FileMeta {
 }
 
 func (p *CorePeer) FetchFilesFromIndex(ctx context.Context) ([]protocol.FileMeta, error) {
-	if p.config.IndexURL == "" {
-		return nil, fmt.Errorf("index URL is not configured")
-	}
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	queryURL := p.config.IndexURL + "/files"
-	reqCtx, cancelReq := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelReq()
-
-	req, err := http.NewRequestWithContext(reqCtx, "GET", queryURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create query request: %w", err)
-	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request to index server failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("server returned status %s: %s", resp.Status, string(respBody))
-	}
-
-	var files []protocol.FileMeta
-	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	p.logger.Printf("Fetched %d files from index server %s", len(files), p.config.IndexURL)
-	return files, nil
+	return p.indexClient.FetchAllFiles(ctx)
 }
 
+// QueryPeersForFile retrieves a list of peers that are serving a specific file by its checksum.
 func (p *CorePeer) QueryPeersForFile(ctx context.Context, checksum string) ([]netip.AddrPort, error) {
-	if p.config.IndexURL == "" {
-		return nil, fmt.Errorf("index URL is not configured")
-	}
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	queryURL := fmt.Sprintf("%s/files/%s/peers", p.config.IndexURL, checksum)
-	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
-	defer cancelReq()
-
-	req, err := http.NewRequestWithContext(reqCtx, "GET", queryURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create query request: %w", err)
-	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request to index server failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("server returned status %s: %s", resp.Status, string(respBody))
-	}
-
-	var peerAddrs []netip.AddrPort
-	if err := json.NewDecoder(resp.Body).Decode(&peerAddrs); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	p.logger.Printf("Found %d peers for file with checksum %s", len(peerAddrs), checksum)
-	return peerAddrs, nil
+	return p.indexClient.QueryFilePeers(ctx, checksum)
 }
 
 // DownloadFileFromPeer downloads a file from another peer.

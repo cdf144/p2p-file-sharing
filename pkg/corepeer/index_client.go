@@ -158,8 +158,15 @@ func (ic *IndexClient) FetchAllFiles(ctx context.Context) ([]protocol.FileMeta, 
 		return nil, fmt.Errorf("index URL is not configured")
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelReq()
+
 	queryURL := ic.indexURL + "/files"
-	req, err := http.NewRequestWithContext(ctx, "GET", queryURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", queryURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create query request: %w", err)
 	}
@@ -189,8 +196,15 @@ func (ic *IndexClient) QueryFilePeers(ctx context.Context, checksum string) ([]n
 		return nil, fmt.Errorf("index URL is not configured")
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelReq()
+
 	queryURL := fmt.Sprintf("%s/files/%s/peers", ic.indexURL, checksum)
-	req, err := http.NewRequestWithContext(ctx, "GET", queryURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", queryURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create query request: %w", err)
 	}

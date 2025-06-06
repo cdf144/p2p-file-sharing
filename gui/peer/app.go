@@ -38,7 +38,7 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) shutdown(ctx context.Context) {
 	wruntime.LogInfo(ctx, "[peer] Application shutting down...")
 	if a.corePeer != nil && a.corePeer.IsServing() {
-		a.corePeer.Stop(a.ctx)
+		a.corePeer.Stop()
 		wruntime.LogInfo(ctx, "[peer] CorePeer stopped gracefully.")
 	}
 }
@@ -138,7 +138,7 @@ func (a *App) StopPeerLogic() error {
 		return nil
 	}
 
-	a.corePeer.Stop(a.ctx)
+	a.corePeer.Stop()
 	wruntime.LogInfo(a.ctx, "[peer] CorePeer stopped.")
 	return nil
 }
