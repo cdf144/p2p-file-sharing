@@ -57,7 +57,7 @@ func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 	}
 }
 
-// Start initializes and starts the peer's operations.
+// Start initializes and starts the CorePeer service, making it ready to share files and participate in the P2P network.
 func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -145,6 +145,9 @@ func (p *CorePeer) GetConfig() CorePeerConfig {
 	return p.config
 }
 
+// UpdateConfig updates the CorePeer configuration with the provided new configuration.
+// It handles changes to share directory, serve port, public port, and index URL (in that order).
+// The method is not fully atomic - partial updates may occur if an error happens during processing.
 func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) (CorePeerConfig, error) {
 	// NOTE: It may be better if this method is atomic, i.e. it should not allow partial updates if an error occur.
 	// PERF: If this method is called with changes to multiple fields, redundant deannounce/reannounce are performed.
@@ -209,6 +212,7 @@ func (p *CorePeer) GetSharedFiles() []protocol.FileMeta {
 	return filesCopy
 }
 
+// FetchFilesFromIndex retrieves all available file metadata from the index server.
 func (p *CorePeer) FetchFilesFromIndex(ctx context.Context) ([]protocol.FileMeta, error) {
 	return p.indexClient.FetchAllFiles(ctx)
 }
@@ -384,6 +388,10 @@ func (p *CorePeer) handleFileRequest(conn net.Conn) {
 	p.logger.Printf("Successfully sent file %s (%d bytes) to %s", localFile.Name, sent, conn.RemoteAddr())
 }
 
+// handleIndexURLChange manages the transition from an old index URL to a new one.
+// If de-announcement from the old index fails, the configuration is rolled back
+// and an error is returned. The method is safe to call with identical old and
+// new URLs (no-op) or empty URLs.
 func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 	if oldIndexURL == newIndexURL {
 		return nil
@@ -410,6 +418,12 @@ func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 	return nil
 }
 
+// handleShareDirChange processes a change in the peer's shared directory configuration.
+// It validates the new directory path, updates internal state, and handles the transition
+// between different sharing states (no directory, old directory, new directory).
+// It returns an error if path resolution fails or server state update fails.
+// On server state update failure, the share directory is reverted to oldShareDir.
+// Scanning and re-announcement failures are logged as warnings but don't cause method failure.
 func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newShareDir string) error {
 	newAbsShareDir := ""
 	if newShareDir != "" {
@@ -453,6 +467,12 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 	return nil
 }
 
+// handleServePortChange updates the peer's serve port configuration and restarts
+// the TCP server if necessary. It validates the new port, updates the configuration,
+// and gracefully restarts the TCP server if the peer is currently serving files.
+// The method handles cases where the port remains unchanged or when the peer is
+// not actively serving. Returns an error if port validation fails or if the
+// TCP server cannot be restarted on the new port.
 func (p *CorePeer) handleServePortChange(oldServePort, newServePort int) error {
 	if oldServePort == newServePort {
 		p.logger.Printf("Serve port remains unchanged: %d", oldServePort)
@@ -482,6 +502,9 @@ func (p *CorePeer) handleServePortChange(oldServePort, newServePort int) error {
 	return nil
 }
 
+// handlePublicPortChange manages the transition from an old public port to a new one.
+// It updates the announced address and re-announces to the index server if the peer
+// is currently serving. If de-announcement fails, the configuration is rolled back.
 func (p *CorePeer) handlePublicPortChange(oldPublicPort, newPublicPort int) error {
 	if oldPublicPort == newPublicPort {
 		p.logger.Printf("Public port remains unchanged: %d", oldPublicPort)
@@ -510,6 +533,8 @@ func (p *CorePeer) handlePublicPortChange(oldPublicPort, newPublicPort int) erro
 	return nil
 }
 
+// stopTCPServer gracefully shuts down the TCP server by canceling the serve context
+// and closing the network listener. After shutdown, the listener is set to nil.
 func (p *CorePeer) stopTCPServer() {
 	if p.serveCancel != nil {
 		p.serveCancel()
@@ -524,6 +549,11 @@ func (p *CorePeer) stopTCPServer() {
 	}
 }
 
+// startTCPServer initializes and starts a TCP server on the configured port.
+// It creates a TCP listener, stores it in the peer instance, and begins accepting
+// incoming connections in a separate goroutine.
+// The server will continue running until the context is cancelled or an error occurs.
+// If a listener already exists, the method returns early without error.
 func (p *CorePeer) startTCPServer(ctx context.Context) error {
 	if p.listener != nil {
 		p.logger.Println("TCP server already running or listener already exists.")
@@ -546,6 +576,10 @@ func (p *CorePeer) startTCPServer(ctx context.Context) error {
 	return nil
 }
 
+// updateTCPServerState manages the TCP server lifecycle based on the desired and current state.
+// It starts the TCP server if it should be running but isn't currently running or if the listener is nil.
+// It stops the TCP server if it shouldn't be running but is currently running.
+// Returns an error if starting the TCP server fails.
 func (p *CorePeer) updateTCPServerState(shouldBeRunning, wasRunning bool) error {
 	if shouldBeRunning && (!wasRunning || p.listener == nil) {
 		p.logger.Printf("Starting TCP server for sharing directory: %s", p.config.ShareDir)
@@ -585,6 +619,8 @@ func (p *CorePeer) scanAndUpdateSharedFiles(ctx context.Context) error {
 	return nil
 }
 
+// processServerPortConfig validates and configures the server port for the CorePeer.
+// It accepts a port number and returns the actual port to be used along with any error.
 func (p *CorePeer) processServerPortConfig(port int) (int, error) {
 	if port < 0 || port > 65535 {
 		return 0, fmt.Errorf("invalid port number: %d. Must be between 0 and 65535", port)
@@ -610,6 +646,7 @@ func (p *CorePeer) processServerPortConfig(port int) (int, error) {
 	return port, nil
 }
 
+// getLocalFileInfoByChecksum retrieves local file information for a file identified by its checksum.
 func (p *CorePeer) getLocalFileInfoByChecksum(checksum string) (*LocalFileInfo, error) {
 	p.mu.RLock()
 	filePath, ok := p.sharedFilePaths[checksum]
