@@ -1,3 +1,26 @@
+export namespace corepeer {
+	
+	export class CorePeerConfig {
+	    IndexURL: string;
+	    ShareDir: string;
+	    ServePort: number;
+	    PublicPort: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new CorePeerConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.IndexURL = source["IndexURL"];
+	        this.ShareDir = source["ShareDir"];
+	        this.ServePort = source["ServePort"];
+	        this.PublicPort = source["PublicPort"];
+	    }
+	}
+
+}
+
 export namespace netip {
 	
 	export class AddrPort {

@@ -1,10 +1,10 @@
 <script lang="ts" setup>
-import { reactive, ref } from 'vue';
+import { reactive, ref, watch } from 'vue';
 
 const DEBOUNCE_DELAY = 300; // ms
 
 const props = defineProps<{
-    initialConfig: {
+    peerConfig: {
         indexURL: string;
         shareDir: string;
         servePort: number;
@@ -16,9 +16,20 @@ const props = defineProps<{
 
 const emit = defineEmits(['update:config', 'toggle-start-stop-peer', 'select-directory']);
 
-const localConfig = reactive({ ...props.initialConfig });
+const localConfig = reactive({ ...props.peerConfig });
 // Delay for input changes to avoid excessive updates
 const debounceTimer = ref<NodeJS.Timeout | null>(null);
+
+watch(
+    () => props.peerConfig,
+    (newPeerConfig) => {
+        localConfig.indexURL = newPeerConfig.indexURL;
+        localConfig.shareDir = newPeerConfig.shareDir;
+        localConfig.servePort = newPeerConfig.servePort;
+        localConfig.publicPort = newPeerConfig.publicPort;
+    },
+    { deep: true },
+);
 
 function handleInput() {
     if (debounceTimer.value) {
@@ -49,7 +60,7 @@ function toggleStartStopPeer() {
                 @input="handleInput"
                 type="text"
                 class="mt-1 block w-full rounded-md border-gray-500 bg-gray-600 px-3 py-2 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 focus:outline-none sm:text-sm"
-                :disabled="isServing || isLoading"
+                :disabled="isLoading"
             />
         </div>
 
@@ -58,7 +69,7 @@ function toggleStartStopPeer() {
                 <label for="shareDir" class="block text-sm font-medium text-gray-300">Share Directory:</label>
                 <input
                     id="shareDir"
-                    :value="initialConfig.shareDir"
+                    :value="props.peerConfig.shareDir"
                     type="text"
                     readonly
                     class="mt-1 block w-full cursor-not-allowed rounded-md border-gray-500 bg-gray-500 px-3 py-2 shadow-sm sm:text-sm"
@@ -86,7 +97,7 @@ function toggleStartStopPeer() {
                     type="number"
                     min="0"
                     class="mt-1 block w-full rounded-md border-gray-500 bg-gray-600 px-3 py-2 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 focus:outline-none sm:text-sm"
-                    :disabled="isServing || isLoading"
+                    :disabled="isLoading"
                 />
             </div>
             <div>
@@ -100,7 +111,7 @@ function toggleStartStopPeer() {
                     type="number"
                     min="0"
                     class="mt-1 block w-full rounded-md border-gray-500 bg-gray-600 px-3 py-2 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 focus:outline-none sm:text-sm"
-                    :disabled="isServing || isLoading"
+                    :disabled="isLoading"
                 />
             </div>
         </div>

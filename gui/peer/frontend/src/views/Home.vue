@@ -9,7 +9,7 @@ import {
     StopPeerLogic,
     UpdatePeerConfig,
 } from '../../wailsjs/go/main/App';
-import { protocol } from '../../wailsjs/go/models';
+import { corepeer, protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
 import NetworkDiscovery from '../components/NetworkDiscovery.vue';
 import NetworkFilesTable from '../components/NetworkFilesTable.vue';
@@ -84,13 +84,18 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
         peerConfig.servePort = configFromChild.servePort;
         peerConfig.publicPort = configFromChild.publicPort;
 
-        const result = await StartPeerLogic(
+        const updatedConfig = await StartPeerLogic(
             peerConfig.indexURL,
             peerConfig.shareDir,
             Number(peerConfig.servePort),
             Number(peerConfig.publicPort),
         );
-        peerState.statusMessage = result;
+        peerConfig.indexURL = updatedConfig.IndexURL;
+        peerConfig.shareDir = updatedConfig.ShareDir;
+        peerConfig.servePort = updatedConfig.ServePort;
+        peerConfig.publicPort = updatedConfig.PublicPort;
+
+        peerState.statusMessage = 'Peer started successfully.';
         peerState.isServing = true;
     } catch (error: any) {
         LogError(`Error starting peer: ${error}`);
@@ -102,18 +107,16 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
 }
 
 function updatePeerConfig(newConfig: typeof peerConfig) {
-    peerConfig.indexURL = newConfig.indexURL;
-    peerConfig.servePort = newConfig.servePort;
-    peerConfig.publicPort = newConfig.publicPort;
-    // TODO: Make peerConfig states reflect the actual configuration in the backend after update.
-    UpdatePeerConfig(
-        peerConfig.indexURL,
-        peerConfig.shareDir,
-        Number(peerConfig.servePort),
-        Number(peerConfig.publicPort),
-    ).catch((error: any) => {
-        LogError(`Error updating peer config: ${error}`);
-    });
+    UpdatePeerConfig(newConfig.indexURL, newConfig.shareDir, Number(newConfig.servePort), Number(newConfig.publicPort))
+        .then((updatedConfig: corepeer.CorePeerConfig) => {
+            peerConfig.indexURL = updatedConfig.IndexURL;
+            peerConfig.shareDir = updatedConfig.ShareDir;
+            peerConfig.servePort = updatedConfig.ServePort;
+            peerConfig.publicPort = updatedConfig.PublicPort;
+        })
+        .catch((error: any) => {
+            LogError(`Error updating peer config: ${error}`);
+        });
 }
 
 async function queryNetwork() {
@@ -172,7 +175,7 @@ onUnmounted(() => {
 
 <template>
     <PeerConfiguration
-        :initial-config="peerConfig"
+        :peerConfig="peerConfig"
         :is-serving="peerState.isServing"
         :is-loading="peerState.isLoading"
         @update:config="updatePeerConfig"

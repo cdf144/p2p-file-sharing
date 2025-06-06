@@ -38,7 +38,6 @@ type CorePeer struct {
 	rootCtx         context.Context // Root context for the peer's lifetime, from Start()
 	listener        net.Listener
 	isServing       bool
-	servePort       uint16
 	serveCtx        context.Context    // Own context for managing internal serving lifecycle
 	serveCancel     context.CancelFunc // Function to cancel serveCtx
 	sharedFiles     []protocol.FileMeta
@@ -80,15 +79,21 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	p.logger.Printf("Determined machine IP: %s", announceIP.String())
 
 	// 2. Start serving files
-	p.servePort = uint16(p.config.ServePort)
-	p.startTCPServer(p.rootCtx)
+	p.config.ServePort, err = p.processServerPortConfig(p.config.ServePort)
+	if err != nil {
+		return "", fmt.Errorf("failed to process serve port configuration: %w", err)
+	}
+	p.logger.Printf("Using serve port: %d", p.config.ServePort)
+	if p.config.ShareDir != "" {
+		p.startTCPServer(p.rootCtx)
+	}
 
 	// 3. Announce to index server
 	var announcePort uint16
 	if p.config.PublicPort != 0 {
 		announcePort = uint16(p.config.PublicPort)
 	} else {
-		announcePort = p.servePort
+		announcePort = uint16(p.config.ServePort)
 	}
 	p.logger.Printf("Announcing with port: %d", announcePort)
 
@@ -98,18 +103,16 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 			p.listener.Close()
 			p.listener = nil
 		}
-		p.serveCancel()
+		if p.serveCancel != nil {
+			p.serveCancel()
+		}
 		return "", fmt.Errorf("failed to announce to index server: %w", err)
 	}
 
 	p.isServing = true
 	statusMsg := fmt.Sprintf(
 		"Peer started. Sharing from: %s. IP: %s, Serving Port: %d, Announced Port: %d. Files shared: %d",
-		p.config.ShareDir,
-		p.announcedAddr.Addr(),
-		p.servePort,
-		p.announcedAddr.Port(),
-		len(p.sharedFiles),
+		p.config.ShareDir, p.announcedAddr.Addr(), p.config.ServePort, p.announcedAddr.Port(), len(p.sharedFiles),
 	)
 	p.logger.Println(statusMsg)
 	return statusMsg, nil
@@ -142,7 +145,9 @@ func (p *CorePeer) GetConfig() CorePeerConfig {
 	return p.config
 }
 
-func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) error {
+func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) (CorePeerConfig, error) {
+	// NOTE: It may be better if this method is atomic, i.e. it should not allow partial updates if an error occur.
+	// PERF: If this method is called with changes to multiple fields, redundant deannounce/reannounce are performed.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -158,31 +163,34 @@ func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) e
 
 	oldConfig := p.config
 
-	// TODO: If servePort changes, we need to stop the listener and start a new one.
-	p.config.IndexURL = newConfig.IndexURL
-	p.config.ServePort = newConfig.ServePort
-	p.config.PublicPort = newConfig.PublicPort
+	if err := p.handleShareDirChange(ctx, oldConfig.ShareDir, newConfig.ShareDir); err != nil {
+		return p.config, fmt.Errorf("failed to handle share directory change: %w", err)
+	}
+
+	if err := p.handleServePortChange(oldConfig.ServePort, newConfig.ServePort); err != nil {
+		return p.config, fmt.Errorf("failed to handle serve port change: %w", err)
+	}
+
+	oldPublicPort := p.config.PublicPort
+	var newPublicPort int
+	if newConfig.PublicPort != 0 {
+		newPublicPort = newConfig.PublicPort
+	} else {
+		newPublicPort = p.config.ServePort
+	}
+	if err := p.handlePublicPortChange(oldPublicPort, newPublicPort); err != nil {
+		return p.config, fmt.Errorf("failed to handle public port change: %w", err)
+	}
 
 	if err := p.handleIndexURLChange(oldConfig.IndexURL, newConfig.IndexURL); err != nil {
-		return err
-	}
-
-	shareDirChanged, err := p.handleShareDirChange(ctx, oldConfig.ShareDir, newConfig.ShareDir)
-	if err != nil {
-		return err
-	}
-
-	if p.isServing && !shareDirChanged {
-		if err := p.handleConfigReannouncement(oldConfig, newConfig); err != nil {
-			return err
-		}
+		return p.config, fmt.Errorf("failed to handle index URL change: %w", err)
 	}
 
 	p.logger.Printf(
 		"CorePeer configuration updated. IndexURL: %s, ServePort: %d, PublicPort: %d, ShareDir: %s",
 		p.config.IndexURL, p.config.ServePort, p.config.PublicPort, p.config.ShareDir,
 	)
-	return nil
+	return p.config, nil
 }
 
 // IsServing returns true if the peer is currently active.
@@ -376,14 +384,15 @@ func (p *CorePeer) handleFileRequest(conn net.Conn) {
 	p.logger.Printf("Successfully sent file %s (%d bytes) to %s", localFile.Name, sent, conn.RemoteAddr())
 }
 
-// handleIndexURLChange manages IndexClient updates when IndexURL changes
 func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 	if oldIndexURL == newIndexURL {
 		return nil
 	}
+	p.config.IndexURL = newIndexURL
 
 	if p.isServing && oldIndexURL != "" {
 		if err := p.indexClient.Deannounce(p.announcedAddr); err != nil {
+			p.config.IndexURL = oldIndexURL
 			return fmt.Errorf("failed to de-announce from old index URL %s: %w", oldIndexURL, err)
 		}
 		p.logger.Printf("De-announced from old index URL: %s", oldIndexURL)
@@ -401,33 +410,31 @@ func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 	return nil
 }
 
-// handleShareDirChange manages share directory updates and returns whether the directory changed
-func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newShareDir string) (bool, error) {
+func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newShareDir string) error {
 	newAbsShareDir := ""
 	if newShareDir != "" {
 		var err error
 		newAbsShareDir, err = filepath.Abs(newShareDir)
 		if err != nil {
-			return false, fmt.Errorf("failed to get absolute path for share directory %s: %w", newShareDir, err)
+			return fmt.Errorf("failed to get absolute path for share directory %s: %w", newShareDir, err)
 		}
 	}
 
 	shareDirChanged := oldShareDir != newAbsShareDir
 	if !shareDirChanged {
-		return false, nil
+		return nil
 	}
 
 	p.logger.Printf("Share directory changing from '%s' to '%s'", oldShareDir, newAbsShareDir)
-	p.config.ShareDir = newAbsShareDir
-
 	p.resetSharedFiles()
+	p.config.ShareDir = newAbsShareDir
 
 	wasPreviouslySharingFromDir := oldShareDir != ""
 	willNowShareFromDir := newAbsShareDir != ""
 
 	if willNowShareFromDir {
 		if err := p.scanAndUpdateSharedFiles(ctx); err != nil {
-			p.logger.Printf("Warning: Failed to scan share directory %s: %v. Shared files will be empty.", p.config.ShareDir, err)
+			p.logger.Printf("Warning: Failed to scan share directory %s: %v. Shared files will be empty.", newAbsShareDir, err)
 		}
 	} else {
 		p.logger.Println("Share directory is now empty. No files are shared from a directory.")
@@ -435,47 +442,74 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 
 	if p.isServing {
 		if err := p.updateTCPServerState(willNowShareFromDir, wasPreviouslySharingFromDir); err != nil {
-			return true, err
+			p.config.ShareDir = oldShareDir
+			return err
 		}
-
 		if err := p.indexClient.Reannounce(p.announcedAddr, p.sharedFiles); err != nil {
 			p.logger.Printf("Warning: Failed to re-announce after share directory update: %v", err)
 		}
 	}
 
-	return true, nil
+	return nil
 }
 
-// handleConfigReannouncement handles re-announcement when IndexURL or PublicPort changes
-func (p *CorePeer) handleConfigReannouncement(oldConfig, newConfig CorePeerConfig) error {
-	oldPublicPort := p.getEffectivePublicPort(oldConfig)
-	newPublicPort := p.getEffectivePublicPort(newConfig)
+func (p *CorePeer) handleServePortChange(oldServePort, newServePort int) error {
+	if oldServePort == newServePort {
+		p.logger.Printf("Serve port remains unchanged: %d", oldServePort)
+		return nil
+	}
 
-	publicPortChanged := oldPublicPort != newPublicPort
-	indexURLChanged := oldConfig.IndexURL != newConfig.IndexURL
+	var err error
+	p.config.ServePort, err = p.processServerPortConfig(newServePort)
+	if err != nil {
+		return fmt.Errorf("failed to process new serve port %d: %w", newServePort, err)
+	}
+	p.logger.Printf("Serve port changing from %d to %d", oldServePort, newServePort)
 
-	if publicPortChanged || (indexURLChanged && newConfig.IndexURL != "") {
-		if publicPortChanged {
-			p.announcedAddr = netip.AddrPortFrom(p.announcedAddr.Addr(), uint16(newPublicPort))
-			p.logger.Printf("Updated announced port to: %d", newPublicPort)
+	if !p.isServing {
+		p.logger.Println("Peer is not serving, no need to restart TCP server.")
+		return nil
+	}
+	p.logger.Printf("Serve port changing, restarting TCP server")
+
+	p.stopTCPServer()
+	if p.config.ShareDir != "" {
+		if err := p.startTCPServer(p.rootCtx); err != nil {
+			return fmt.Errorf("failed to restart TCP server on new port %d: %w", newServePort, err)
 		}
-
-		p.logger.Printf(
-			"Re-announcing due to configuration changes (PublicPort changed: %v, IndexURL changed: %v)",
-			publicPortChanged, indexURLChanged,
-		)
-
-		if err := p.indexClient.Reannounce(p.announcedAddr, p.sharedFiles); err != nil {
-			return fmt.Errorf("failed to re-announce after config change: %w", err)
-		}
-
-		p.logger.Printf("Successfully re-announced with updated configuration")
 	}
 
 	return nil
 }
 
-// stopTCPServer stops the TCP file server
+func (p *CorePeer) handlePublicPortChange(oldPublicPort, newPublicPort int) error {
+	if oldPublicPort == newPublicPort {
+		p.logger.Printf("Public port remains unchanged: %d", oldPublicPort)
+		return nil
+	}
+	p.logger.Printf("Public port changing from %d to %d", oldPublicPort, newPublicPort)
+	p.config.PublicPort = newPublicPort
+
+	if !p.isServing {
+		p.logger.Println("Peer is not serving, no need to re-announce.")
+		return nil
+	}
+
+	if err := p.indexClient.Deannounce(p.announcedAddr); err != nil {
+		p.config.PublicPort = oldPublicPort
+		return fmt.Errorf("failed to de-announce from index server: %w", err)
+	}
+	p.logger.Printf("De-announced from index server due to public port change from %d to %d", oldPublicPort, newPublicPort)
+
+	p.announcedAddr = netip.AddrPortFrom(p.announcedAddr.Addr(), uint16(newPublicPort))
+	if err := p.indexClient.Announce(p.announcedAddr, p.sharedFiles); err != nil {
+		return fmt.Errorf("failed to re-announce to index server with new public port %d: %w", newPublicPort, err)
+	}
+	p.logger.Printf("Re-announced to index server with new public port: %d", newPublicPort)
+
+	return nil
+}
+
 func (p *CorePeer) stopTCPServer() {
 	if p.serveCancel != nil {
 		p.serveCancel()
@@ -490,7 +524,6 @@ func (p *CorePeer) stopTCPServer() {
 	}
 }
 
-// startTCPServer starts the TCP server for the current servePort
 func (p *CorePeer) startTCPServer(ctx context.Context) error {
 	if p.listener != nil {
 		p.logger.Println("TCP server already running or listener already exists.")
@@ -500,23 +533,11 @@ func (p *CorePeer) startTCPServer(ctx context.Context) error {
 		return fmt.Errorf("cannot start TCP server, context is not active or nil")
 	}
 
-	var l net.Listener
-	var err error
-
-	if p.servePort == 0 {
-		l, err = net.Listen("tcp", ":0")
-		if err != nil {
-			return fmt.Errorf("failed to listen on random port: %w", err)
-		}
-		p.servePort = uint16(l.Addr().(*net.TCPAddr).Port)
-		p.logger.Printf("TCP server started on randomly assigned port: %d", p.servePort)
-	} else {
-		l, err = net.Listen("tcp", fmt.Sprintf(":%d", p.servePort))
-		if err != nil {
-			return fmt.Errorf("failed to listen on port %d: %w", p.servePort, err)
-		}
-		p.logger.Printf("TCP server started on port: %d", p.servePort)
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", p.config.ServePort))
+	if err != nil {
+		return fmt.Errorf("failed to listen on port %d: %w", p.config.ServePort, err)
 	}
+	p.logger.Printf("TCP server started on port: %d", p.config.ServePort)
 
 	p.listener = l
 	p.serveCtx, p.serveCancel = context.WithCancel(ctx)
@@ -525,7 +546,6 @@ func (p *CorePeer) startTCPServer(ctx context.Context) error {
 	return nil
 }
 
-// updateTCPServerState manages TCP server state based on sharing requirements
 func (p *CorePeer) updateTCPServerState(shouldBeRunning, wasRunning bool) error {
 	if shouldBeRunning && (!wasRunning || p.listener == nil) {
 		p.logger.Printf("Starting TCP server for sharing directory: %s", p.config.ShareDir)
@@ -565,12 +585,29 @@ func (p *CorePeer) scanAndUpdateSharedFiles(ctx context.Context) error {
 	return nil
 }
 
-// getEffectivePublicPort returns the effective public port (PublicPort or ServePort if PublicPort is 0)
-func (p *CorePeer) getEffectivePublicPort(config CorePeerConfig) int {
-	if config.PublicPort != 0 {
-		return config.PublicPort
+func (p *CorePeer) processServerPortConfig(port int) (int, error) {
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("invalid port number: %d. Must be between 0 and 65535", port)
 	}
-	return config.ServePort
+
+	if port == 0 {
+		l, err := net.Listen("tcp", ":0")
+		if err != nil {
+			return 0, fmt.Errorf("failed to listen on random port: %w", err)
+		}
+		defer l.Close()
+		port = l.Addr().(*net.TCPAddr).Port
+		p.logger.Printf("Assigned random port: %d", port)
+	} else {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return 0, fmt.Errorf("failed to listen on port %d: %w", port, err)
+		}
+		defer l.Close()
+		p.logger.Printf("Listening on port: %d", port)
+	}
+
+	return port, nil
 }
 
 func (p *CorePeer) getLocalFileInfoByChecksum(checksum string) (*LocalFileInfo, error) {

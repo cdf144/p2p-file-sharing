@@ -63,9 +63,9 @@ func (a *App) SelectShareDirectory() (string, error) {
 	return dir, nil
 }
 
-func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort int) (string, error) {
+func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort int) (corepeer.CorePeerConfig, error) {
 	if a.corePeer == nil {
-		return "", fmt.Errorf("CorePeer not initialized")
+		return corepeer.CorePeerConfig{}, fmt.Errorf("CorePeer not initialized")
 	}
 
 	newConfig := corepeer.CorePeerConfig{
@@ -75,9 +75,11 @@ func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort 
 		PublicPort: publicPort,
 	}
 
-	if err := a.corePeer.UpdateConfig(a.ctx, newConfig); err != nil {
+	var updatedConfig corepeer.CorePeerConfig
+	var err error
+	if updatedConfig, err = a.corePeer.UpdateConfig(a.ctx, newConfig); err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
-		return "", fmt.Errorf("failed to update CorePeer config: %w", err)
+		return updatedConfig, fmt.Errorf("failed to update CorePeer config: %w", err)
 	}
 
 	wruntime.EventsEmit(a.ctx, "filesScanned", a.corePeer.GetSharedFiles())
@@ -88,12 +90,12 @@ func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort 
 		indexURL, shareDir, servePort, publicPort,
 	)
 
-	return "CorePeer configuration updated successfully", nil
+	return updatedConfig, nil
 }
 
-func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort int) (string, error) {
+func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort int) (corepeer.CorePeerConfig, error) {
 	if a.corePeer.IsServing() {
-		return "Peer is already running", nil
+		return a.corePeer.GetConfig(), nil
 	}
 
 	config := corepeer.CorePeerConfig{
@@ -103,9 +105,10 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 		PublicPort: publicPort,
 	}
 
-	if err := a.corePeer.UpdateConfig(a.ctx, config); err != nil {
+	var updatedConfig corepeer.CorePeerConfig
+	if updatedConfig, err := a.corePeer.UpdateConfig(a.ctx, config); err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
-		return "", fmt.Errorf("failed to update CorePeer config: %w", err)
+		return updatedConfig, fmt.Errorf("failed to update CorePeer config: %w", err)
 	}
 
 	wruntime.LogInfof(
@@ -117,13 +120,13 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 	statusMsg, err := a.corePeer.Start(a.ctx)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to start CorePeer: %v", err)
-		return "", fmt.Errorf("failed to start peer: %w", err)
+		return updatedConfig, fmt.Errorf("failed to start CorePeer: %w", err)
 	}
 
 	wruntime.EventsEmit(a.ctx, "filesScanned", a.corePeer.GetSharedFiles())
 
 	wruntime.LogInfo(a.ctx, "[peer] "+statusMsg)
-	return statusMsg, nil
+	return updatedConfig, nil
 }
 
 func (a *App) StopPeerLogic() error {
