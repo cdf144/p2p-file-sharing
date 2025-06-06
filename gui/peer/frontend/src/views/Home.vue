@@ -42,15 +42,19 @@ const allNetworkFiles = computed(() => networkState.networkFiles || []);
 
 async function handleSelectDirectory() {
     try {
-        peerConfig.shareDir = '';
-        peerState.statusMessage = 'Selected directory. Scanning for files...';
+        peerState.statusMessage = 'Selecting directory...';
         const selectedDir = await SelectShareDirectory();
+        peerConfig.shareDir = selectedDir;
+        updatePeerConfig({ ...peerConfig });
+
         if (selectedDir) {
-            peerConfig.shareDir = selectedDir;
-            peerState.statusMessage = `Selected directory: ${selectedDir}. Scan results will appear below if files are found.`;
+            peerState.statusMessage = `Share directory set to: ${selectedDir}. Configuration updated. Scan results will appear if files are found.`;
+        } else {
+            peerState.statusMessage = 'Share directory cleared or selection cancelled. Configuration updated.';
         }
-    } catch (error) {
-        peerState.statusMessage = `Error selecting directory: ${error}`;
+    } catch (error: any) {
+        peerState.statusMessage = `Error selecting directory: ${error.message || error}`;
+        LogError(`Error in handleSelectDirectory: ${error}`);
     }
 }
 
@@ -101,6 +105,7 @@ function updatePeerConfig(newConfig: typeof peerConfig) {
     peerConfig.indexURL = newConfig.indexURL;
     peerConfig.servePort = newConfig.servePort;
     peerConfig.publicPort = newConfig.publicPort;
+    // TODO: Make peerConfig states reflect the actual configuration in the backend after update.
     UpdatePeerConfig(
         peerConfig.indexURL,
         peerConfig.shareDir,

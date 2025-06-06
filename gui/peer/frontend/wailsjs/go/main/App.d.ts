@@ -5,8 +5,6 @@ import {protocol} from '../models';
 
 export function DownloadFileWithDialog(arg1:netip.AddrPort,arg2:string,arg3:string):Promise<string>;
 
-export function DummyFileMeta():Promise<protocol.FileMeta>;
-
 export function DummyPeerInfo():Promise<protocol.PeerInfo>;
 
 export function FetchNetworkFiles():Promise<Array<protocol.FileMeta>>;

@@ -37,6 +37,7 @@ type CorePeerConfig struct {
 // CorePeer manages the core P2P logic.
 type CorePeer struct {
 	config          CorePeerConfig
+	listener        net.Listener
 	isServing       bool
 	servePort       uint16
 	serveCtx        context.Context    // Own context for managing internal serving lifecycle
@@ -58,12 +59,12 @@ func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 
 // Start initializes and starts the peer's operations.
 func (p *CorePeer) Start(ctx context.Context) (string, error) {
-	p.mu.RLock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.isServing {
-		p.mu.RUnlock()
 		return "Peer is already running", nil
 	}
-	p.mu.RUnlock()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -83,15 +84,15 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to listen on a random port: %w", err)
 		}
+		p.listener = l
 		p.servePort = uint16(l.Addr().(*net.TCPAddr).Port)
-		l.Close()
 		p.logger.Printf("No serve port specified. Listening on randomly assigned port: %d", p.servePort)
 	} else {
 		l, err := net.Listen("tcp", fmt.Sprintf(":%d", servePort))
 		if err != nil {
 			return "", fmt.Errorf("failed to listen on port %d: %w", servePort, err)
 		}
-		l.Close()
+		p.listener = l
 		p.servePort = uint16(servePort)
 		p.logger.Printf("Listening on specified port: %d", p.servePort)
 	}
@@ -105,16 +106,30 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	}
 	p.logger.Printf("Announcing with port: %d", announcePort)
 
-	// 4. Announce to index server
+	// 4. Start serving files
+	p.serveCtx, p.serveCancel = context.WithCancel(ctx)
+	if p.config.ShareDir != "" {
+		go p.acceptConnections(p.serveCtx)
+		p.logger.Printf("TCP file server listening on %s for directory %s", p.listener.Addr().String(), p.config.ShareDir)
+	} else {
+		p.listener.Close()
+		p.listener = nil
+		p.serveCancel()
+		p.logger.Println("No share directory specified, TCP file server not started.")
+	}
+
+	// 5. Announce to index server
 	p.announcedAddr = netip.AddrPortFrom(announceIP, announcePort)
-	if err := p.announce(ctx); err != nil {
+	if err := p.announce(); err != nil {
+		if p.listener != nil {
+			p.listener.Close()
+			p.listener = nil
+		}
+		p.serveCancel()
 		return "", fmt.Errorf("failed to announce to index server: %w", err)
 	}
 
-	// 5. Start serving files
-	p.serveCtx, p.serveCancel = context.WithCancel(ctx)
-	go p.serveFiles(p.serveCtx, p.config.ShareDir)
-
+	p.isServing = true
 	statusMsg := fmt.Sprintf(
 		"Peer started. Sharing from: %s. IP: %s, Serving Port: %d, Announced Port: %d. Files shared: %d",
 		p.config.ShareDir,
@@ -130,26 +145,36 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 // Stop halts the peer's operations.
 func (p *CorePeer) Stop(ctx context.Context) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if !p.isServing {
-		p.mu.Unlock()
 		p.logger.Println("Peer is not running.")
 		return
 	}
-	p.isServing = false
-	p.mu.Unlock()
-
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	if err := p.deannounce(); err != nil {
+		p.logger.Printf("Warning: Failed to de-announce from index server: %v", err)
+		return
 	}
 
 	if p.serveCancel != nil {
 		p.serveCancel()
 	}
-	p.logger.Println("Serving stopped.")
-
-	if err := p.deannounce(ctx); err != nil {
-		p.logger.Printf("Warning: Failed to de-announce from index server: %v", err)
+	if p.listener != nil {
+		err := p.listener.Close()
+		if err != nil {
+			if !strings.Contains(err.Error(), "use of closed network connection") {
+				p.logger.Printf("Warning: Error closing listener: %v", err)
+			}
+		}
+		p.listener = nil
 	}
+
+	p.isServing = false
+	p.logger.Println("Peer stopped.")
 }
 
 // GetConfig returns a copy of the current configuration of the CorePeer.
@@ -159,7 +184,7 @@ func (p *CorePeer) GetConfig() CorePeerConfig {
 	return p.config
 }
 
-func (p *CorePeer) UpdateConfig(ctx context.Context, cfg CorePeerConfig) error {
+func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -167,27 +192,41 @@ func (p *CorePeer) UpdateConfig(ctx context.Context, cfg CorePeerConfig) error {
 		p.logger.Println("Warning: Updating configuration while peer is serving. Some changes may require a restart of the peer to take full effect.")
 	}
 
-	p.config.IndexURL = cfg.IndexURL
-	p.config.ServePort = cfg.ServePort
-	p.config.PublicPort = cfg.PublicPort
+	oldShareDir := p.config.ShareDir
 
-	if cfg.ShareDir != "" {
-		absShareDir, err := filepath.Abs(cfg.ShareDir)
+	p.config.IndexURL = newConfig.IndexURL
+	p.config.ServePort = newConfig.ServePort
+	p.config.PublicPort = newConfig.PublicPort
+
+	newAbsShareDir := ""
+	if newConfig.ShareDir != "" {
+		var err error
+		newAbsShareDir, err = filepath.Abs(newConfig.ShareDir)
 		if err != nil {
-			return fmt.Errorf("failed to get absolute path for share directory %s: %w", cfg.ShareDir, err)
+			return fmt.Errorf("failed to get absolute path for share directory %s: %w", newConfig.ShareDir, err)
 		}
+	}
 
-		if p.config.ShareDir != absShareDir {
-			p.config.ShareDir = absShareDir
-			p.sharedFiles = []protocol.FileMeta{}
-			p.sharedFilePaths = make(map[string]string)
+	shareDirChanged := oldShareDir != newAbsShareDir
+	wasPreviouslySharingFromDir := oldShareDir != ""
+	willNowShareFromDir := newAbsShareDir != ""
 
-			p.logger.Printf("Scanning directory: %s", p.config.ShareDir)
-			scannedFiles, scannedPaths, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
-			if err != nil {
+	if shareDirChanged {
+		p.logger.Printf("Share directory changing from '%s' to '%s'", oldShareDir, newAbsShareDir)
+		p.config.ShareDir = newAbsShareDir
+
+		p.sharedFiles = []protocol.FileMeta{}
+		p.sharedFilePaths = make(map[string]string)
+
+		if !willNowShareFromDir {
+			p.logger.Println("Share directory is now empty. No files are shared from a directory.")
+		} else {
+			p.logger.Printf("Scanning new directory: %s", p.config.ShareDir)
+			scannedFiles, scannedPaths, errScan := ScanDirectory(ctx, p.config.ShareDir, p.logger)
+			if errScan != nil {
 				p.logger.Printf(
-					"Warning: Failed to scan share directory %s: %v. Falling back to empty shared files.",
-					p.config.ShareDir, err,
+					"Warning: Failed to scan share directory %s: %v. Shared files will be empty.",
+					p.config.ShareDir, errScan,
 				)
 			} else {
 				p.sharedFiles = scannedFiles
@@ -195,7 +234,65 @@ func (p *CorePeer) UpdateConfig(ctx context.Context, cfg CorePeerConfig) error {
 				p.logger.Printf("Scanned %d files from %s", len(p.sharedFiles), p.config.ShareDir)
 			}
 		}
+
+		if p.isServing {
+			if willNowShareFromDir && (!wasPreviouslySharingFromDir || p.listener == nil) {
+				p.logger.Printf("Share directory '%s' is now active. Ensuring TCP file server is running.", p.config.ShareDir)
+				if p.listener == nil {
+					p.logger.Println("Listener is nil. Attempting to start TCP listener.")
+					l, err := net.Listen("tcp", fmt.Sprintf(":%d", p.servePort))
+					if err != nil {
+						p.logger.Printf("ERROR: Failed to listen on port %d for ShareDir '%s': %v. Files announced but may not be servable.", p.servePort, p.config.ShareDir, err)
+					} else {
+						p.listener = l
+						p.logger.Printf(
+							"TCP server listener started on %s for directory %s",
+							p.listener.Addr().String(), p.config.ShareDir,
+						)
+						if p.serveCancel != nil {
+							p.serveCancel()
+						}
+						p.serveCtx, p.serveCancel = context.WithCancel(context.Background())
+						go p.acceptConnections(p.serveCtx)
+						p.logger.Printf("acceptConnections goroutine started for %s", p.config.ShareDir)
+					}
+				} else {
+					if p.serveCtx == nil || p.serveCtx.Err() != nil {
+						p.logger.Println("Listener exists but serveCtx is done. Restarting acceptConnections.")
+						if p.serveCancel != nil {
+							p.serveCancel()
+						}
+						p.serveCtx, p.serveCancel = context.WithCancel(context.Background())
+						go p.acceptConnections(p.serveCtx)
+						p.logger.Printf("acceptConnections goroutine restarted for %s", p.config.ShareDir)
+					} else {
+						p.logger.Printf("Listener is already active on port %d. No change to listener state needed.", p.servePort)
+					}
+				}
+			} else if !willNowShareFromDir && wasPreviouslySharingFromDir {
+				p.logger.Printf("Share directory is now empty. Stopping TCP file server.")
+				if p.listener != nil {
+					if p.serveCancel != nil {
+						p.serveCancel()
+					}
+					err := p.listener.Close()
+					if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+						p.logger.Printf("Warning: Error closing listener: %v", err)
+					}
+					p.listener = nil
+					p.logger.Println("TCP file server listener stopped because ShareDir is empty.")
+				}
+			}
+
+			p.logger.Printf("Peer is serving, re-announcing with updated file list/status due to ShareDir change.")
+			if errReannounce := p.reannounce(); errReannounce != nil {
+				p.logger.Printf("Warning: Failed to re-announce after share directory update: %v", errReannounce)
+			}
+		}
 	}
+
+	// TODO: If IndexURL or PublicPort changes while we are serving (and ShareDir didn't), we should re-announce.
+	// TODO: If ServePort changes while we are serving, we should stop the current server and start a new one on the new port.
 
 	p.logger.Printf(
 		"CorePeer configuration updated. IndexURL: %s, ServePort: %d, PublicPort: %d, ShareDir: %s",
@@ -218,49 +315,6 @@ func (p *CorePeer) GetSharedFiles() []protocol.FileMeta {
 	filesCopy := make([]protocol.FileMeta, len(p.sharedFiles))
 	copy(filesCopy, p.sharedFiles)
 	return filesCopy
-}
-
-// SetSharedDirectory sets the directory to be shared and re-scans for files in it.
-// If shareDir is empty, it clears the current shared files.
-func (p *CorePeer) SetSharedDirectory(ctx context.Context, shareDir string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	if shareDir == "" {
-		p.logger.Println("Clearing shared directory.")
-		p.sharedFiles = []protocol.FileMeta{}
-		p.sharedFilePaths = make(map[string]string)
-		if p.isServing {
-			go p.reannounce(context.Background())
-		}
-		return nil
-	}
-
-	absShareDir, err := filepath.Abs(shareDir)
-	if err != nil {
-		return fmt.Errorf("failed to get absolute path for share directory %s: %w", shareDir, err)
-	}
-	p.config.ShareDir = absShareDir
-
-	p.logger.Printf("Setting new share directory: %s", p.config.ShareDir)
-	scannedFiles, scannedPaths, scanErr := ScanDirectory(ctx, p.config.ShareDir, p.logger)
-	if scanErr != nil {
-		p.sharedFiles = []protocol.FileMeta{}
-		p.sharedFilePaths = make(map[string]string)
-		return fmt.Errorf("failed to scan new share directory %s: %w", p.config.ShareDir, scanErr)
-	}
-	p.sharedFiles = scannedFiles
-	p.sharedFilePaths = scannedPaths
-	p.logger.Printf("Updated shared files: %d files found.", len(p.sharedFiles))
-
-	if p.isServing {
-		go p.reannounce(context.Background())
-	}
-	return nil
 }
 
 func (p *CorePeer) FetchFilesFromIndex(ctx context.Context) ([]protocol.FileMeta, error) {
@@ -424,7 +478,8 @@ func (p *CorePeer) DownloadFileFromPeer(
 }
 
 // announce sends peer information to the index server.
-func (p *CorePeer) announce(ctx context.Context) error {
+// It assumes p.mu is already locked by the caller.
+func (p *CorePeer) announce() error {
 	if p.config.IndexURL == "" {
 		p.logger.Println("IndexURL is not configured. Skipping announce.")
 		return nil
@@ -440,7 +495,7 @@ func (p *CorePeer) announce(ctx context.Context) error {
 	}
 
 	announceURL := p.config.IndexURL + "/peers/announce"
-	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
+	reqCtx, cancelReq := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelReq()
 
 	req, err := http.NewRequestWithContext(reqCtx, "POST", announceURL, bytes.NewBuffer(jsonData))
@@ -464,7 +519,9 @@ func (p *CorePeer) announce(ctx context.Context) error {
 	return nil
 }
 
-func (p *CorePeer) deannounce(ctx context.Context) error {
+// deannounce removes the peer's information from the index server.
+// It assumes p.mu is already locked by the caller.
+func (p *CorePeer) deannounce() error {
 	if p.config.IndexURL == "" {
 		p.logger.Println("IndexURL is not configured. Skipping de-announce.")
 		return nil
@@ -480,7 +537,7 @@ func (p *CorePeer) deannounce(ctx context.Context) error {
 	}
 
 	deannounceURL := p.config.IndexURL + "/peers/deannounce"
-	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
+	reqCtx, cancelReq := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelReq()
 
 	req, err := http.NewRequestWithContext(reqCtx, "POST", deannounceURL, bytes.NewBuffer(jsonData))
@@ -504,7 +561,9 @@ func (p *CorePeer) deannounce(ctx context.Context) error {
 	return nil
 }
 
-func (p *CorePeer) reannounce(ctx context.Context) error {
+// reannounce sends the peer's updated information to the index server.
+// It assumes p.mu is already locked by the caller.
+func (p *CorePeer) reannounce() error {
 	if p.config.IndexURL == "" {
 		p.logger.Println("IndexURL is not configured. Skipping re-announce.")
 		return nil
@@ -514,20 +573,19 @@ func (p *CorePeer) reannounce(ctx context.Context) error {
 		return fmt.Errorf("cannot re-announce without a valid announced address")
 	}
 
-	p.mu.RLock()
 	peerInfo := protocol.PeerInfo{
 		Address: p.announcedAddr,
-		Files:   p.sharedFiles,
+		Files:   make([]protocol.FileMeta, len(p.sharedFiles)),
 	}
+	copy(peerInfo.Files, p.sharedFiles)
 	reannounceURL := p.config.IndexURL + "/peers/reannounce"
-	p.mu.RUnlock()
 
 	jsonData, err := json.Marshal(peerInfo)
 	if err != nil {
 		return fmt.Errorf("failed to marshal peer info for re-announce: %w", err)
 	}
 
-	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
+	reqCtx, cancelReq := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelReq()
 
 	req, err := http.NewRequestWithContext(reqCtx, "POST", reannounceURL, bytes.NewBuffer(jsonData))
@@ -552,42 +610,31 @@ func (p *CorePeer) reannounce(ctx context.Context) error {
 	return nil
 }
 
-// serveFiles starts the TCP server to listen for file requests.
-func (p *CorePeer) serveFiles(ctx context.Context, shareDir string) {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", p.servePort))
-	if err != nil {
-		p.logger.Printf("Failed to start TCP file server on port %d: %v", p.servePort, err)
+// acceptConnections starts the TCP file server and handles incoming connections.
+func (p *CorePeer) acceptConnections(ctx context.Context) {
+	if p.listener == nil {
+		p.logger.Println("Error: acceptConnections called with a nil listener.")
 		return
 	}
-
-	p.mu.Lock()
-	p.isServing = true
-	p.mu.Unlock()
-
-	p.logger.Printf("Starting TCP file server on %s for directory %s", listener.Addr().String(), shareDir)
-
-	go func() {
-		<-ctx.Done()
-		p.logger.Printf("Shutting down TCP file server on %s", listener.Addr().String())
-		listener.Close()
-	}()
+	p.logger.Printf("Accepting connections on %s", p.listener.Addr().String())
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := p.listener.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				p.logger.Printf("TCP server on %s stopped gracefully.", listener.Addr().String())
+				p.logger.Println("Context cancelled, server accept loop stopping gracefully.")
 				return
 			default:
-				p.logger.Printf("Failed to accept connection: %v", err)
-				if ne, ok := err.(net.Error); ok && !ne.Timeout() {
-					p.logger.Printf("Warning: Permanent error accepting connections: %v. Stopping server.", err)
-					return
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					p.logger.Println("Listener closed, server accept loop stopping.")
+				} else {
+					p.logger.Printf("Error accepting connection: %v. Server accept loop stopping.", err)
 				}
-				continue
+				return
 			}
 		}
+		p.logger.Printf("Accepted connection from %s", conn.RemoteAddr().String())
 		go p.handleFileRequest(conn)
 	}
 }

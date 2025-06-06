@@ -43,17 +43,6 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 }
 
-// DummyFileMeta is a dummy method to satisfy the Wails binding requirements, helping
-// Wails generate the protocol.FileMeta type for the frontend.
-// It's not intended to be called by the frontend for any real purpose.
-func (a *App) DummyFileMeta() protocol.FileMeta {
-	return protocol.FileMeta{
-		Checksum: "dummy-checksum",
-		Name:     "dummy-file.txt",
-		Size:     0,
-	}
-}
-
 // DummyPeerInfo is a dummy method to satisfy the Wails binding requirements, helping
 // Wails generate the protocol.PeerInfo type for the frontend.
 // It's not intended to be called by the frontend for any real purpose.
@@ -71,14 +60,6 @@ func (a *App) SelectShareDirectory() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to select directory: %w", err)
 	}
-
-	err = a.corePeer.SetSharedDirectory(a.ctx, dir)
-	if err != nil {
-		wruntime.LogErrorf(a.ctx, "[peer] Failed to set shared directory: %v", err)
-		return "", fmt.Errorf("failed to set shared directory: %w", err)
-	}
-	wruntime.EventsEmit(a.ctx, "filesScanned", a.corePeer.GetSharedFiles())
-
 	return dir, nil
 }
 
@@ -98,6 +79,8 @@ func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort 
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
 		return "", fmt.Errorf("failed to update CorePeer config: %w", err)
 	}
+
+	wruntime.EventsEmit(a.ctx, "filesScanned", a.corePeer.GetSharedFiles())
 
 	wruntime.LogInfof(
 		a.ctx,

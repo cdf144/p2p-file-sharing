@@ -6,10 +6,6 @@ export function DownloadFileWithDialog(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadFileWithDialog'](arg1, arg2, arg3);
 }
 
-export function DummyFileMeta() {
-  return window['go']['main']['App']['DummyFileMeta']();
-}
-
 export function DummyPeerInfo() {
   return window['go']['main']['App']['DummyPeerInfo']();
 }
