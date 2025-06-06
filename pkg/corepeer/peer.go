@@ -35,6 +35,7 @@ type CorePeerConfig struct {
 type CorePeer struct {
 	config          CorePeerConfig
 	indexClient     *IndexClient
+	rootCtx         context.Context // Root context for the peer's lifetime, from Start()
 	listener        net.Listener
 	isServing       bool
 	servePort       uint16
@@ -69,6 +70,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	p.rootCtx = ctx
 
 	// 1. Determine IP address
 	announceIP, err := DetermineMachineIP()
@@ -77,27 +79,11 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	}
 	p.logger.Printf("Determined machine IP: %s", announceIP.String())
 
-	// 2. Determine serve port
-	servePort := p.config.ServePort
-	if servePort == 0 {
-		l, err := net.Listen("tcp", ":0")
-		if err != nil {
-			return "", fmt.Errorf("failed to listen on a random port: %w", err)
-		}
-		p.listener = l
-		p.servePort = uint16(l.Addr().(*net.TCPAddr).Port)
-		p.logger.Printf("No serve port specified. Listening on randomly assigned port: %d", p.servePort)
-	} else {
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", servePort))
-		if err != nil {
-			return "", fmt.Errorf("failed to listen on port %d: %w", servePort, err)
-		}
-		p.listener = l
-		p.servePort = uint16(servePort)
-		p.logger.Printf("Listening on specified port: %d", p.servePort)
-	}
+	// 2. Start serving files
+	p.servePort = uint16(p.config.ServePort)
+	p.startTCPServer(p.rootCtx)
 
-	// 3. Determine announce port
+	// 3. Announce to index server
 	var announcePort uint16
 	if p.config.PublicPort != 0 {
 		announcePort = uint16(p.config.PublicPort)
@@ -106,19 +92,6 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	}
 	p.logger.Printf("Announcing with port: %d", announcePort)
 
-	// 4. Start serving files
-	p.serveCtx, p.serveCancel = context.WithCancel(ctx)
-	if p.config.ShareDir != "" {
-		go p.acceptConnections(p.serveCtx)
-		p.logger.Printf("TCP file server listening on %s for directory %s", p.listener.Addr().String(), p.config.ShareDir)
-	} else {
-		p.listener.Close()
-		p.listener = nil
-		p.serveCancel()
-		p.logger.Println("No share directory specified, TCP file server not started.")
-	}
-
-	// 5. Announce to index server
 	p.announcedAddr = netip.AddrPortFrom(announceIP, announcePort)
 	if err := p.indexClient.Announce(p.announcedAddr, p.sharedFiles); err != nil {
 		if p.listener != nil {
@@ -172,6 +145,12 @@ func (p *CorePeer) GetConfig() CorePeerConfig {
 func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Defensive check: if not serving but listener exists, ensure it's stopped.
+	if !p.isServing && p.listener != nil {
+		p.logger.Println("Warning: Peer is not serving, but listener exists. Stopping listener.")
+		p.stopTCPServer()
+	}
 
 	if p.isServing {
 		p.logger.Println("Warning: Updating configuration while peer is serving. Some changes may require a restart of the peer to take full effect.")
@@ -514,19 +493,35 @@ func (p *CorePeer) stopTCPServer() {
 // startTCPServer starts the TCP server for the current servePort
 func (p *CorePeer) startTCPServer(ctx context.Context) error {
 	if p.listener != nil {
+		p.logger.Println("TCP server already running or listener already exists.")
 		return nil
 	}
+	if ctx == nil || ctx.Err() != nil {
+		return fmt.Errorf("cannot start TCP server, context is not active or nil")
+	}
 
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", p.servePort))
-	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %w", p.servePort, err)
+	var l net.Listener
+	var err error
+
+	if p.servePort == 0 {
+		l, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return fmt.Errorf("failed to listen on random port: %w", err)
+		}
+		p.servePort = uint16(l.Addr().(*net.TCPAddr).Port)
+		p.logger.Printf("TCP server started on randomly assigned port: %d", p.servePort)
+	} else {
+		l, err = net.Listen("tcp", fmt.Sprintf(":%d", p.servePort))
+		if err != nil {
+			return fmt.Errorf("failed to listen on port %d: %w", p.servePort, err)
+		}
+		p.logger.Printf("TCP server started on port: %d", p.servePort)
 	}
 
 	p.listener = l
 	p.serveCtx, p.serveCancel = context.WithCancel(ctx)
 	go p.acceptConnections(p.serveCtx)
 
-	p.logger.Printf("TCP server started on %s", p.listener.Addr().String())
 	return nil
 }
 
@@ -534,7 +529,11 @@ func (p *CorePeer) startTCPServer(ctx context.Context) error {
 func (p *CorePeer) updateTCPServerState(shouldBeRunning, wasRunning bool) error {
 	if shouldBeRunning && (!wasRunning || p.listener == nil) {
 		p.logger.Printf("Starting TCP server for sharing directory: %s", p.config.ShareDir)
-		return p.startTCPServer(p.serveCtx)
+		if p.rootCtx == nil {
+			p.logger.Println("Error: peerRootCtx is nil, cannot start TCP server. Peer might not have been started correctly.")
+			return fmt.Errorf("peerRootCtx is nil, cannot start TCP server")
+		}
+		return p.startTCPServer(p.rootCtx)
 	} else if !shouldBeRunning && wasRunning {
 		p.logger.Println("Stopping TCP server - no directory to share.")
 		p.stopTCPServer()
