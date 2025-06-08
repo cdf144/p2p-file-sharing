@@ -1,8 +1,12 @@
 package corepeer
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -55,36 +59,19 @@ func ScanDirectory(
 					logger.Printf("Worker %d: Scan cancelled.", workerID)
 					return
 				default:
-					info, err := os.Stat(path)
+					processedFileMeta, err := processFileAndCalcChunks(ctx, path)
 					if err != nil {
-						logger.Printf("Worker %d: failed to stat file %s: %v", workerID, path, err)
-						continue
-					}
-					if info.IsDir() { // Should not happen when WalkDir sends only files, but just in case
-						continue
-					}
-
-					file, err := os.Open(path)
-					if err != nil {
-						logger.Printf("Worker %d: failed to open file %s: %v", workerID, path, err)
-						continue
-					}
-
-					checksum, err := protocol.GenerateChecksum(file)
-					file.Close()
-
-					if err != nil {
-						logger.Printf("Worker %d: failed to generate checksum for file %s: %v", workerID, path, err)
+						if err == context.Canceled || err == context.DeadlineExceeded {
+							logger.Printf("Worker %d: Scan cancelled while processing %s.", workerID, path)
+						} else {
+							logger.Printf("Worker %d: Failed to process file %s: %v", workerID, path, err)
+						}
 						continue
 					}
 
 					select {
 					case jobResults <- scanResult{
-						meta: protocol.FileMeta{
-							Checksum: checksum,
-							Name:     info.Name(),
-							Size:     info.Size(),
-						},
+						meta: processedFileMeta,
 						path: path,
 					}:
 						// Successfully sent result to jobResults channel
@@ -199,4 +186,83 @@ func FindSharedFileByChecksum(shareDir, checksum string, logger *log.Logger) (*L
 		return nil, fmt.Errorf("file with checksum %s not found in share directory %s", checksum, shareDir)
 	}
 	return result, nil
+}
+
+// processFileAndCalcChunks opens a file, calculates its overall checksum,
+// divides it into chunks, calculates checksums for each chunk,
+// and returns its metadata. This is done in a single pass over the file.
+func processFileAndCalcChunks(ctx context.Context, filePath string) (protocol.FileMeta, error) {
+	select {
+	case <-ctx.Done():
+		return protocol.FileMeta{}, ctx.Err()
+	default:
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return protocol.FileMeta{}, fmt.Errorf("failed to open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return protocol.FileMeta{}, fmt.Errorf("failed to stat file %s: %w", filePath, err)
+	}
+
+	if info.IsDir() { // Should not happen when WalkDir sends only files, but just in case
+		return protocol.FileMeta{}, fmt.Errorf("path %s is a directory, not a file", filePath)
+	}
+
+	fileSize := info.Size()
+	numChunks := int((fileSize + protocol.CHUNK_SIZE - 1) / protocol.CHUNK_SIZE)
+
+	fullFileHasher := sha256.New()
+	chunkHashes := make([]string, 0, numChunks)
+	buf := make([]byte, protocol.CHUNK_SIZE)
+
+	for i := range numChunks {
+		select {
+		case <-ctx.Done():
+			return protocol.FileMeta{}, ctx.Err()
+		default:
+		}
+
+		bytesToRead := protocol.CHUNK_SIZE
+		if i == numChunks-1 {
+			if remainder := fileSize % protocol.CHUNK_SIZE; remainder != 0 {
+				bytesToRead = int(remainder)
+			}
+		}
+
+		n, readErr := io.ReadFull(file, buf[:bytesToRead])
+		if readErr != nil {
+			return protocol.FileMeta{}, fmt.Errorf(
+				"failed to read chunk %d for file %s (expected %d bytes): %w",
+				i, filePath, bytesToRead, readErr,
+			)
+		}
+
+		chunkData := buf[:n]
+
+		if _, err := fullFileHasher.Write(chunkData); err != nil {
+			return protocol.FileMeta{}, fmt.Errorf("failed to write chunk %d data to overall hasher for %s: %w", i, filePath, err)
+		}
+
+		chunkHash, err := protocol.GenerateChecksum(bytes.NewReader(chunkData))
+		if err != nil {
+			return protocol.FileMeta{}, fmt.Errorf("failed to generate checksum for chunk %d of file %s: %w", i, filePath, err)
+		}
+		chunkHashes = append(chunkHashes, chunkHash)
+	}
+
+	fullFileChecksum := hex.EncodeToString(fullFileHasher.Sum(nil))
+
+	return protocol.FileMeta{
+		Checksum:    fullFileChecksum,
+		Name:        info.Name(),
+		Size:        fileSize,
+		ChunkSize:   protocol.CHUNK_SIZE,
+		NumChunks:   numChunks,
+		ChunkHashes: chunkHashes,
+	}, nil
 }

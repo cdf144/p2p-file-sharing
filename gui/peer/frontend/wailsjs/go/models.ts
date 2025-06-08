@@ -44,6 +44,9 @@ export namespace protocol {
 	    checksum: string;
 	    name: string;
 	    size: number;
+	    chunkSize: number;
+	    numChunks: number;
+	    chunkHashes: string[];
 	
 	    static createFrom(source: any = {}) {
 	        return new FileMeta(source);
@@ -54,6 +57,9 @@ export namespace protocol {
 	        this.checksum = source["checksum"];
 	        this.name = source["name"];
 	        this.size = source["size"];
+	        this.chunkSize = source["chunkSize"];
+	        this.numChunks = source["numChunks"];
+	        this.chunkHashes = source["chunkHashes"];
 	    }
 	}
 	export class PeerInfo {

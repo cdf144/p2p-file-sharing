@@ -190,6 +190,50 @@ func (ic *IndexClient) FetchAllFiles(ctx context.Context) ([]protocol.FileMeta, 
 	return files, nil
 }
 
+// FetchOneFile retrieves specific file metadata from the index server by its checksum.
+func (ic *IndexClient) FetchOneFile(ctx context.Context, checksum string) (protocol.FileMeta, error) {
+	if ic.indexURL == "" {
+		return protocol.FileMeta{}, fmt.Errorf("index URL is not configured")
+	}
+	if checksum == "" {
+		return protocol.FileMeta{}, fmt.Errorf("checksum cannot be empty")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	reqCtx, cancelReq := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelReq()
+
+	queryURL := fmt.Sprintf("%s/files/%s", ic.indexURL, checksum)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", queryURL, nil)
+	if err != nil {
+		return protocol.FileMeta{}, fmt.Errorf("failed to create fetch file meta request: %w", err)
+	}
+
+	resp, err := ic.httpClient.Do(req)
+	if err != nil {
+		return protocol.FileMeta{}, fmt.Errorf("request to index server for file meta failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return protocol.FileMeta{}, fmt.Errorf("file meta not found for checksum %s (status 404)", checksum)
+	}
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return protocol.FileMeta{}, fmt.Errorf("server returned status %s for file meta: %s", resp.Status, string(respBody))
+	}
+
+	var fileMeta protocol.FileMeta
+	if err := json.NewDecoder(resp.Body).Decode(&fileMeta); err != nil {
+		return protocol.FileMeta{}, fmt.Errorf("failed to decode file meta response: %w", err)
+	}
+	ic.logger.Printf("Fetched FileMeta for checksum %s from index server %s", checksum, ic.indexURL)
+	return fileMeta, nil
+}
+
 // QueryFilePeers retrieves a list of peers that are serving a specific file by its checksum.
 func (ic *IndexClient) QueryFilePeers(ctx context.Context, checksum string) ([]netip.AddrPort, error) {
 	if ic.indexURL == "" {

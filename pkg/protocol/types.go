@@ -25,10 +25,14 @@ type PeerInfoSummary struct {
 // FileMeta represents the metadata of a file shared by a peer in the P2P network.
 // It includes the checksum for integrity verification,
 // the name of the file, and its size in bytes.
+// For chunk-based transfer, it also includes chunk details.
 type FileMeta struct {
-	Checksum string `json:"checksum"`
-	Name     string `json:"name"`
-	Size     int64  `json:"size"`
+	Checksum    string   `json:"checksum"`
+	Name        string   `json:"name"`
+	Size        int64    `json:"size"`
+	ChunkSize   int64    `json:"chunkSize"`
+	NumChunks   int      `json:"numChunks"`
+	ChunkHashes []string `json:"chunkHashes"`
 }
 
 // MessageType represents the different types of messages in the P2P protocol
@@ -37,8 +41,12 @@ type MessageType uint8
 const (
 	FILE_REQUEST MessageType = iota
 	FILE_DATA
+	CHUNK_REQUEST
+	CHUNK_DATA
 	ERROR
 )
+
+const CHUNK_SIZE = 1024 * 1024 // 1 MB
 
 // String returns the string representation of the MessageType
 func (mt MessageType) String() string {
@@ -47,6 +55,10 @@ func (mt MessageType) String() string {
 		return "FILE_REQUEST"
 	case FILE_DATA:
 		return "FILE_DATA"
+	case CHUNK_REQUEST:
+		return "CHUNK_REQUEST"
+	case CHUNK_DATA:
+		return "CHUNK_DATA"
 	case ERROR:
 		return "ERROR"
 	default:

@@ -106,7 +106,8 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 	}
 
 	var updatedConfig corepeer.CorePeerConfig
-	if updatedConfig, err := a.corePeer.UpdateConfig(a.ctx, config); err != nil {
+	var err error
+	if updatedConfig, err = a.corePeer.UpdateConfig(a.ctx, config); err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to update CorePeer config: %v", err)
 		return updatedConfig, fmt.Errorf("failed to update CorePeer config: %w", err)
 	}
@@ -153,7 +154,6 @@ func (a *App) FetchNetworkFiles() ([]protocol.FileMeta, error) {
 		return nil, fmt.Errorf("CorePeer not initialized")
 	}
 
-	// Call the FetchFilesFromIndex method on the corePeer instance
 	files, err := a.corePeer.FetchFilesFromIndex(a.ctx)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to fetch files from index server: %v", err)
@@ -183,6 +183,20 @@ func (a *App) DownloadFileWithDialog(
 	peerAddrPort netip.AddrPort,
 	fileChecksum, fileName string,
 ) (string, error) {
+	if a.corePeer == nil {
+		return "", fmt.Errorf("CorePeer not initialized")
+	}
+
+	wruntime.LogInfof(a.ctx, "[peer] Fetching metadata for file %s (checksum: %s) before download.", fileName, fileChecksum)
+	fileMeta, err := a.corePeer.FetchFileFromIndex(a.ctx, fileChecksum)
+	if err != nil {
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to fetch metadata for file %s: %v", fileName, err)
+		return "", fmt.Errorf("failed to get metadata for file %s: %w", fileName, err)
+	}
+	if fileMeta.Name == "" {
+		wruntime.LogWarningf(a.ctx, "[peer] Fetched FileMeta for %s has no name, using provided: %s", fileChecksum, fileName)
+	}
+
 	saveDir, err := wruntime.SaveFileDialog(a.ctx, wruntime.SaveDialogOptions{
 		Title:           "Save Downloaded File",
 		DefaultFilename: fileName,
@@ -196,20 +210,19 @@ func (a *App) DownloadFileWithDialog(
 		return "Save cancelled by user.", nil
 	}
 
-	wruntime.LogInfof(a.ctx, "[peer] Attempting to download file %s (checksum: %s) from %s:%d to %s",
-		fileName, fileChecksum, peerAddrPort.Addr(), peerAddrPort.Port(), saveDir)
+	wruntime.LogInfof(
+		a.ctx,
+		"[peer] Attempting to download file %s (checksum: %s) from %s to %s using chunk method",
+		fileMeta.Name, fileMeta.Checksum, peerAddrPort.String(), saveDir,
+	)
 
-	if a.corePeer == nil {
-		return "", fmt.Errorf("CorePeer not initialized")
-	}
-
-	err = a.corePeer.DownloadFileFromPeer(peerAddrPort, fileChecksum, fileName, saveDir)
+	err = a.corePeer.DownloadFileFromPeer(a.ctx, peerAddrPort, fileMeta, saveDir)
 	if err != nil {
-		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file: %v", err)
-		return "", err
+		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file %s: %v", fileMeta.Name, err)
+		return "", fmt.Errorf("failed to download file %s: %w", fileMeta.Name, err)
 	}
 
-	successMsg := fmt.Sprintf("Successfully downloaded %s to %s", fileName, saveDir)
+	successMsg := fmt.Sprintf("Successfully downloaded %s to %s", fileMeta.Name, saveDir)
 	wruntime.LogInfo(a.ctx, "[peer] "+successMsg)
 	return successMsg, nil
 }

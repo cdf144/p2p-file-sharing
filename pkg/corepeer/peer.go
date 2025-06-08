@@ -222,51 +222,30 @@ func (p *CorePeer) QueryPeersForFile(ctx context.Context, checksum string) ([]ne
 	return p.indexClient.QueryFilePeers(ctx, checksum)
 }
 
-// DownloadFileFromPeer downloads a file from another peer.
+// FetchFileFromIndex retrieves the metadata for a specific file from the index server.
+func (p *CorePeer) FetchFileFromIndex(ctx context.Context, fileChecksum string) (protocol.FileMeta, error) {
+	return p.indexClient.FetchOneFile(ctx, fileChecksum)
+}
+
+// DownloadFileFromPeer downloads a file from another peer by requesting it chunk by chunk.
+// It requires the full FileMeta of the file to know chunk details.
 func (p *CorePeer) DownloadFileFromPeer(
+	ctx context.Context,
 	peerAddr netip.AddrPort,
-	fileChecksum, fileName string,
+	fileMeta protocol.FileMeta,
 	savePath string,
 ) error {
-	conn, err := net.DialTimeout(
-		"tcp",
-		peerAddr.String(),
-		10*time.Second,
+	if fileMeta.NumChunks == 0 && fileMeta.Size > 0 {
+		return fmt.Errorf("file metadata indicates non-empty file but zero chunks for %s", fileMeta.Name)
+	}
+	if fileMeta.NumChunks > 0 && len(fileMeta.ChunkHashes) != fileMeta.NumChunks {
+		return fmt.Errorf("inconsistent chunk hash count for %s: expected %d, got %d", fileMeta.Name, fileMeta.NumChunks, len(fileMeta.ChunkHashes))
+	}
+
+	p.logger.Printf(
+		"Starting download of %s (%s, %d chunks) from %s to %s",
+		fileMeta.Name, fileMeta.Checksum, fileMeta.NumChunks, peerAddr, savePath,
 	)
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer %s: %w", peerAddr, err)
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(fmt.Appendf(nil, "%s %s\n", protocol.FILE_REQUEST.String(), fileChecksum))
-	if err != nil {
-		return fmt.Errorf("failed to send request to peer: %w", err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("failed to read response header from peer: %w", err)
-	}
-
-	response = strings.TrimSpace(response)
-	if strings.HasPrefix(response, protocol.ERROR.String()+" ") {
-		return fmt.Errorf("peer error: %s", strings.TrimPrefix(response, protocol.ERROR.String()+" "))
-	}
-	if !strings.HasPrefix(response, protocol.FILE_DATA.String()+" ") {
-		return fmt.Errorf("unexpected response from peer: %s", response)
-	}
-
-	fileSizeStr := strings.TrimPrefix(response, protocol.FILE_DATA.String()+" ")
-	fileSize, err := strconv.ParseInt(fileSizeStr, 10, 64)
-	if err != nil {
-		return fmt.Errorf("invalid file size in response '%s': %w", fileSizeStr, err)
-	}
-
-	// NOTE: Arbitrary timeout for file transfer.
-	conn.SetReadDeadline(time.Now().Add(30 * time.Minute))
 
 	file, err := os.Create(savePath)
 	if err != nil {
@@ -274,35 +253,177 @@ func (p *CorePeer) DownloadFileFromPeer(
 	}
 	defer file.Close()
 
-	p.logger.Printf(
-		"Downloading file %s (%d bytes) from %s to %s",
-		fileName,
-		fileSize,
-		peerAddr,
-		savePath,
-	)
-
-	hash := sha256.New()
-	teeReader := io.TeeReader(reader, hash) // Read from connection, also write to hash
-	limitedTeeReader := io.LimitReader(teeReader, fileSize)
-
-	written, err := io.Copy(file, limitedTeeReader)
-	if err != nil {
-		os.Remove(savePath)
-		return fmt.Errorf("failed to download file content: %w", err)
-	}
-	if written != fileSize {
-		os.Remove(savePath)
-		return fmt.Errorf("incomplete download: expected %d bytes, got %d", fileSize, written)
+	if fileMeta.Size > 0 {
+		if err := file.Truncate(fileMeta.Size); err != nil {
+			p.logger.Printf("Warning: Failed to pre-allocate file size for %s: %v", savePath, err)
+		}
 	}
 
-	actualChecksum := hex.EncodeToString(hash.Sum(nil))
-	if actualChecksum != fileChecksum {
-		os.Remove(savePath)
-		return fmt.Errorf("checksum mismatch: expected %s, actual %s", fileChecksum, actualChecksum)
+	overallFileHasher := sha256.New()
+
+	for i := range fileMeta.NumChunks {
+		select {
+		case <-ctx.Done():
+			os.Remove(savePath)
+			return fmt.Errorf("download cancelled for %s: %w", fileMeta.Name, ctx.Err())
+		default:
+		}
+
+		p.logger.Printf("Downloading chunk %d/%d for %s from %s", i+1, fileMeta.NumChunks, fileMeta.Name, peerAddr)
+
+		conn, err := net.DialTimeout("tcp", peerAddr.String(), 10*time.Second)
+		if err != nil {
+			os.Remove(savePath)
+			return fmt.Errorf("failed to connect to peer %s for chunk %d: %w", peerAddr, i, err)
+		}
+
+		writer := bufio.NewWriter(conn)
+		reader := bufio.NewReader(conn)
+
+		if _, err := writer.Write([]byte{byte(protocol.CHUNK_REQUEST)}); err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to write CHUNK_REQUEST type for chunk %d: %w", i, err)
+		}
+		if _, err := writer.WriteString(fileMeta.Checksum + "\n"); err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to write file checksum for chunk %d: %w", i, err)
+		}
+		if _, err := writer.WriteString(strconv.Itoa(i) + "\n"); err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to write chunk index %d: %w", i, err)
+		}
+		if err := writer.Flush(); err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to flush CHUNK_REQUEST for chunk %d: %w", i, err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		msgTypeByte, err := reader.ReadByte()
+		if err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to read response type for chunk %d: %w", i, err)
+		}
+
+		if protocol.MessageType(msgTypeByte) == protocol.ERROR {
+			errMsg, _ := reader.ReadString('\n')
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("peer returned error for chunk %d: %s", i, strings.TrimSpace(errMsg))
+		}
+
+		if protocol.MessageType(msgTypeByte) != protocol.CHUNK_DATA {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("unexpected response type %d for chunk %d", msgTypeByte, i)
+		}
+
+		respFileChecksum, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to read response file checksum for chunk %d: %w", i, err)
+		}
+		respFileChecksum = strings.TrimSpace(respFileChecksum)
+		if respFileChecksum != fileMeta.Checksum {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("checksum mismatch in response for chunk %d: expected %s, got %s", i, fileMeta.Checksum, respFileChecksum)
+		}
+
+		respChunkIndexStr, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to read response chunk index for chunk %d: %w", i, err)
+		}
+		respChunkIndex, err := strconv.Atoi(strings.TrimSpace(respChunkIndexStr))
+		if err != nil || respChunkIndex != i {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf(
+				"chunk index mismatch in response for chunk %d: expected %d, got %s (%v)",
+				i, i, respChunkIndexStr, err,
+			)
+		}
+
+		chunkLengthStr, err := reader.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to read chunk length for chunk %d: %w", i, err)
+		}
+		chunkLength, err := strconv.ParseInt(strings.TrimSpace(chunkLengthStr), 10, 64)
+		if err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("invalid chunk length '%s' for chunk %d: %w", chunkLengthStr, i, err)
+		}
+		if chunkLength <= 0 || chunkLength > fileMeta.ChunkSize {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("invalid chunk length %d for chunk %d (max %d)", chunkLength, i, fileMeta.ChunkSize)
+		}
+
+		chunkData := make([]byte, chunkLength)
+		n, err := io.ReadFull(reader, chunkData)
+		if err != nil {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("failed to read chunk %d data (expected %d bytes): %w", i, chunkLength, err)
+		}
+		if int64(n) != chunkLength {
+			conn.Close()
+			os.Remove(savePath)
+			return fmt.Errorf("incomplete chunk %d data: read %d, expected %d", i, n, chunkLength)
+		}
+		conn.Close()
+
+		// Debugging line to save chunk data. Fire corrupted in transit confirmed.
+		os.WriteFile("/home/darkroom/chunk_data.jpg", chunkData, 0o644)
+
+		currentChunkHasher := sha256.New()
+		currentChunkHasher.Write(chunkData)
+		actualChunkChecksum := hex.EncodeToString(currentChunkHasher.Sum(nil))
+
+		if actualChunkChecksum != fileMeta.ChunkHashes[i] {
+			os.Remove(savePath)
+			return fmt.Errorf(
+				"checksum mismatch for chunk %d of %s: expected %s, actual %s",
+				i+1, fileMeta.Name, fileMeta.ChunkHashes[i], actualChunkChecksum,
+			)
+		}
+
+		offset := int64(i) * fileMeta.ChunkSize
+		_, err = file.WriteAt(chunkData, offset)
+		if err != nil {
+			os.Remove(savePath)
+			return fmt.Errorf("failed to write chunk %d to file %s: %w", i, savePath, err)
+		}
+
+		if _, err := overallFileHasher.Write(chunkData); err != nil {
+			p.logger.Printf("Error writing chunk to overall hasher: %v", err)
+		}
+		p.logger.Printf("Successfully downloaded and verified chunk %d for %s", i, fileMeta.Name)
 	}
 
-	p.logger.Printf("Successfully downloaded and verified file %s to %s", fileName, savePath)
+	if fileMeta.Size > 0 {
+		actualOverallChecksum := hex.EncodeToString(overallFileHasher.Sum(nil))
+		if actualOverallChecksum != fileMeta.Checksum {
+			os.Remove(savePath)
+			return fmt.Errorf("overall checksum mismatch for %s: expected %s, actual %s", fileMeta.Name, fileMeta.Checksum, actualOverallChecksum)
+		}
+		p.logger.Printf("Overall file checksum verified for %s", fileMeta.Name)
+	} else {
+		p.logger.Printf("File %s is empty, skipping final overall checksum verification.", fileMeta.Name)
+	}
+
+	p.logger.Printf("Successfully downloaded and verified all %d chunks for file %s to %s", fileMeta.NumChunks, fileMeta.Name, savePath)
 	return nil
 }
 
@@ -331,50 +452,198 @@ func (p *CorePeer) acceptConnections(ctx context.Context) {
 			}
 		}
 		p.logger.Printf("Accepted connection from %s", conn.RemoteAddr().String())
-		go p.handleFileRequest(conn)
+		go p.handleConnection(conn)
 	}
 }
 
-// handleFileRequest processes an incoming file request.
-func (p *CorePeer) handleFileRequest(conn net.Conn) {
+func (p *CorePeer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 	reader := bufio.NewReader(conn)
-	request, err := reader.ReadString('\n')
+	writer := bufio.NewWriter(conn)
+
+	msgTypeByte, err := reader.ReadByte()
 	if err != nil {
-		p.logger.Printf("Warning: Failed to read request from %s: %v", conn.RemoteAddr(), err)
+		if err != io.EOF {
+			p.logger.Printf("Warning: Failed to read message type from %s: %v", conn.RemoteAddr(), err)
+		}
 		return
 	}
 
-	request = strings.TrimSpace(request)
-	p.logger.Printf("Received request from %s: %s", conn.RemoteAddr(), request)
-	if !strings.HasPrefix(request, protocol.FILE_REQUEST.String()+" ") {
-		conn.Write(fmt.Appendf(nil, "%s Invalid request format\n", protocol.ERROR.String()))
+	msgType := protocol.MessageType(msgTypeByte)
+	p.logger.Printf("Received message type %s (%d) from %s", msgType.String(), msgTypeByte, conn.RemoteAddr())
+
+	switch msgType {
+	case protocol.CHUNK_REQUEST:
+		p.handleChunkRequestCommand(conn, reader, writer)
+	case protocol.FILE_REQUEST:
+		p.handleFileRequestCommand(conn, reader, writer)
+	default:
+		p.logger.Printf("Warning: Received unknown message type %d from %s", msgTypeByte, conn.RemoteAddr())
+		p.sendError(writer, conn.RemoteAddr().String(), "Unknown message type")
+	}
+}
+
+// handleChunkRequestCommand processes a CHUNK_REQUEST message.
+func (p *CorePeer) handleChunkRequestCommand(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) {
+	fileChecksum, err := reader.ReadString('\n')
+	if err != nil {
+		p.logger.Printf("Warning: Failed to read file checksum for CHUNK_REQUEST from %s: %v", conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read file checksum")
 		return
 	}
-	checksum := strings.TrimSpace(strings.TrimPrefix(request, protocol.FILE_REQUEST.String()+" "))
+	fileChecksum = strings.TrimSpace(fileChecksum)
+
+	chunkIndexStr, err := reader.ReadString('\n')
+	if err != nil {
+		p.logger.Printf("Warning: Failed to read chunk index for CHUNK_REQUEST from %s: %v", conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read chunk index")
+		return
+	}
+	chunkIndexStr = strings.TrimSpace(chunkIndexStr)
+	chunkIndex, err := strconv.Atoi(chunkIndexStr)
+	if err != nil {
+		p.logger.Printf("Warning: Invalid chunk index '%s' for CHUNK_REQUEST from %s: %v", chunkIndexStr, conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Invalid chunk index format")
+		return
+	}
+
+	fileMeta, err := p.getSharedFileMetaByChecksum(fileChecksum)
+	if err != nil {
+		p.logger.Printf("Warning: FileMeta not found for checksum %s (CHUNK_REQUEST by %s): %v", fileChecksum, conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), fmt.Sprintf("File not found for checksum %s", fileChecksum))
+		return
+	}
+
+	if chunkIndex < 0 || (fileMeta.NumChunks > 0 && chunkIndex >= fileMeta.NumChunks) || (fileMeta.NumChunks == 0 && chunkIndex != 0) {
+		errMsg := fmt.Sprintf("Invalid chunk index %d for file %s (NumChunks: %d)", chunkIndex, fileMeta.Name, fileMeta.NumChunks)
+		p.logger.Printf("Warning: %s, requested by %s", errMsg, conn.RemoteAddr())
+		p.sendError(writer, conn.RemoteAddr().String(), errMsg)
+		return
+	}
+	if fileMeta.NumChunks == 0 { // Also implies fileMeta.Size == 0
+		errMsg := fmt.Sprintf("File %s is empty, no chunks to request (NumChunks: 0)", fileMeta.Name)
+		p.logger.Printf("Warning: %s, requested by %s", errMsg, conn.RemoteAddr())
+		p.sendError(writer, conn.RemoteAddr().String(), errMsg)
+		return
+	}
+
+	p.mu.RLock()
+	filePath := p.sharedFilePaths[fileChecksum]
+	p.mu.RUnlock()
+	if filePath == "" {
+		p.logger.Printf("Critical: File path for checksum %s is empty despite FileMeta existing. CHUNK_REQUEST by %s", fileChecksum, conn.RemoteAddr())
+		p.sendError(writer, conn.RemoteAddr().String(), "Internal server error: file path missing")
+		return
+	}
+
+	fileHandle, err := os.Open(filePath)
+	if err != nil {
+		p.logger.Printf("Warning: Failed to open file %s for CHUNK_REQUEST by %s: %v", filePath, conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Failed to open file for chunk")
+		return
+	}
+	defer fileHandle.Close()
+
+	chunkOffset := int64(chunkIndex) * fileMeta.ChunkSize
+	bytesToRead := fileMeta.ChunkSize
+	if chunkIndex == fileMeta.NumChunks-1 {
+		if remainder := fileMeta.Size % fileMeta.ChunkSize; remainder != 0 {
+			bytesToRead = remainder
+		}
+	}
+
+	chunkData := make([]byte, bytesToRead)
+	if _, err = fileHandle.Seek(chunkOffset, io.SeekStart); err != nil {
+		p.logger.Printf("Warning: Failed to seek to chunk offset %d for file %s (CHUNK_REQUEST by %s): %v", chunkOffset, filePath, conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Failed to seek to chunk")
+		return
+	}
+
+	n, err := io.ReadFull(fileHandle, chunkData)
+	if err != nil {
+		p.logger.Printf("Warning: Failed to read chunk %d from file %s (expected %d bytes, got %d) for %s: %v", chunkIndex, filePath, bytesToRead, n, conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read chunk data")
+		return
+	}
+	actualChunkData := chunkData[:n]
+
+	conn.SetWriteDeadline(time.Now().Add(1 * time.Minute))
+
+	if _, err := writer.Write([]byte{byte(protocol.CHUNK_DATA)}); err != nil {
+		p.logger.Printf("Warning: Failed to write CHUNK_DATA message type to buffer for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if _, err := writer.WriteString(fileChecksum + "\n"); err != nil {
+		p.logger.Printf("Warning: Failed to write file checksum to buffer for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if _, err := writer.WriteString(strconv.Itoa(chunkIndex) + "\n"); err != nil {
+		p.logger.Printf("Warning: Failed to write chunk index to buffer for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if _, err := writer.WriteString(fmt.Sprintf("%d\n", int64(n))); err != nil {
+		p.logger.Printf("Warning: Failed to write chunk length to buffer for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if _, err := writer.Write(actualChunkData); err != nil {
+		p.logger.Printf(
+			"Warning: Failed to write chunk %d payload for file %s to buffer for %s: %v",
+			chunkIndex, fileMeta.Name, conn.RemoteAddr(), err,
+		)
+		return
+	}
+
+	if err := writer.Flush(); err != nil {
+		p.logger.Printf(
+			"Warning: Failed to flush CHUNK_DATA message for file %s chunk %d to %s: %v",
+			fileMeta.Name, chunkIndex, conn.RemoteAddr(), err,
+		)
+		return
+	}
+
+	p.logger.Printf(
+		"Successfully sent chunk %d (%d bytes) for file %s (%s) to %s",
+		chunkIndex, n, fileMeta.Name, fileChecksum, conn.RemoteAddr(),
+	)
+}
+
+// handleFileRequestCommand processes a FILE_REQUEST message.
+func (p *CorePeer) handleFileRequestCommand(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) {
+	checksum, err := reader.ReadString('\n')
+	if err != nil {
+		p.logger.Printf("Warning: Failed to read checksum for FILE_REQUEST from %s: %v", conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read checksum")
+		return
+	}
+	checksum = strings.TrimSpace(checksum)
 
 	localFile, err := p.getLocalFileInfoByChecksum(checksum)
 	if err != nil {
-		p.logger.Printf("Warning: File not found for checksum %s requested by %s: %v", checksum, conn.RemoteAddr(), err)
-		conn.Write(fmt.Appendf(nil, "%s File not found for checksum %s\n", protocol.ERROR.String(), checksum))
+		p.logger.Printf("Warning: File not found for checksum %s (FILE_REQUEST by %s): %v", checksum, conn.RemoteAddr(), err)
+		p.sendError(writer, conn.RemoteAddr().String(), fmt.Sprintf("File not found for checksum %s", checksum))
 		return
 	}
 
-	// NOTE: Arbitrary timeout for file transfer.
+	if _, err := writer.Write([]byte{byte(protocol.FILE_DATA)}); err != nil {
+		p.logger.Printf("Warning: Failed to write FILE_DATA message type to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
+		return
+	}
+	if _, err := writer.WriteString(fmt.Sprintf("%d\n", localFile.Size)); err != nil {
+		p.logger.Printf("Warning: Failed to write file size to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		p.logger.Printf("Warning: Failed to flush FILE_DATA header to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
+		return
+	}
+
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
-
-	_, err = conn.Write(fmt.Appendf(nil, "%s %d\n", protocol.FILE_DATA.String(), localFile.Size))
-	if err != nil {
-		p.logger.Printf("Warning: Failed to send file data header to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
-		return
-	}
 
 	fileHandle, err := os.Open(localFile.Path)
 	if err != nil {
-		p.logger.Printf("Warning: Failed to open file %s: %v", localFile.Path, err)
-		conn.Write(fmt.Appendf(nil, "%s Failed to open file\n", protocol.ERROR))
+		p.logger.Printf("Warning: Failed to open file %s for FILE_REQUEST by %s: %v", localFile.Path, conn.RemoteAddr(), err)
 		return
 	}
 	defer fileHandle.Close()
@@ -384,8 +653,26 @@ func (p *CorePeer) handleFileRequest(conn net.Conn) {
 		p.logger.Printf("Warning: Failed to send file %s to %s: %v", localFile.Name, conn.RemoteAddr(), err)
 		return
 	}
+	if sent != localFile.Size {
+		p.logger.Printf("Warning: Incomplete file transfer for %s to %s: sent %d, expected %d", localFile.Name, conn.RemoteAddr(), sent, localFile.Size)
+		return
+	}
 
-	p.logger.Printf("Successfully sent file %s (%d bytes) to %s", localFile.Name, sent, conn.RemoteAddr())
+	p.logger.Printf("Successfully sent file %s (%d bytes) to %s via FILE_REQUEST", localFile.Name, sent, conn.RemoteAddr())
+}
+
+func (p *CorePeer) sendError(writer *bufio.Writer, remoteAddr string, errorMessage string) {
+	if _, err := writer.Write([]byte{byte(protocol.ERROR)}); err != nil {
+		p.logger.Printf("Warning: Failed to write ERROR message type to %s: %v", remoteAddr, err)
+		return
+	}
+	if _, err := writer.WriteString(errorMessage + "\n"); err != nil {
+		p.logger.Printf("Warning: Failed to write error message string to %s: %v", remoteAddr, err)
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		p.logger.Printf("Warning: Failed to flush error message to %s: %v", remoteAddr, err)
+	}
 }
 
 // handleIndexURLChange manages the transition from an old index URL to a new one.
@@ -474,7 +761,7 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 // not actively serving. Returns an error if port validation fails or if the
 // TCP server cannot be restarted on the new port.
 func (p *CorePeer) handleServePortChange(oldServePort, newServePort int) error {
-	if oldServePort == newServePort {
+	if oldServePort == newServePort && newServePort != 0 {
 		p.logger.Printf("Serve port remains unchanged: %d", oldServePort)
 		return nil
 	}
@@ -669,4 +956,20 @@ func (p *CorePeer) getLocalFileInfoByChecksum(checksum string) (*LocalFileInfo, 
 		Name:     info.Name(),
 		Size:     info.Size(),
 	}, nil
+}
+
+func (p *CorePeer) getSharedFileMetaByChecksum(checksum string) (protocol.FileMeta, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if _, ok := p.sharedFilePaths[checksum]; !ok {
+		return protocol.FileMeta{}, fmt.Errorf("file with checksum %s not found in shared file paths", checksum)
+	}
+
+	for _, fm := range p.sharedFiles {
+		if fm.Checksum == checksum {
+			return fm, nil
+		}
+	}
+	return protocol.FileMeta{}, fmt.Errorf("file metadata for checksum %s not found in shared files list (inconsistent state)", checksum)
 }

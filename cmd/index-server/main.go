@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,57 +36,25 @@ func main() {
 		logger:   log.New(log.Writer(), "[index-server] ", log.LstdFlags|log.Lmsgprefix),
 	}
 
-	http.HandleFunc("/peers", indexServer.PeersHandler)
-	// Catches /peers/announce, /peers/deannounce, /peers/{ip}/{port}/files
-	http.HandleFunc("/peers/", indexServer.PeersHandler)
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/files", indexServer.FilesHandler)
-	// Catches /files/{checksum} and /files/{checksum}/peers
-	http.HandleFunc("/files/", indexServer.FilesHandler)
+	mux.HandleFunc("GET /peers", indexServer.handleGetAllPeers)
+	mux.HandleFunc("GET /peers/{ip}/{port}/files", indexServer.handleGetOnePeerFiles)
+	mux.HandleFunc("POST /peers/announce", indexServer.handlePostPeerAnnounce)
+	mux.HandleFunc("POST /peers/deannounce", indexServer.handlePostPeerDeannounce)
+	mux.HandleFunc("POST /peers/reannounce", indexServer.handlePostPeerReannounce)
 
-	http.HandleFunc("/search", indexServer.SearchHandler)
-	// Catches /search/files?name={name}
-	http.HandleFunc("/search/", indexServer.SearchHandler)
+	mux.HandleFunc("GET /files", indexServer.handleGetAllFiles)
+	mux.HandleFunc("GET /files/{checksum}", indexServer.handleGetOneFile)
+	mux.HandleFunc("GET /files/{checksum}/peers", indexServer.handleGetOneFilePeers)
+
+	mux.HandleFunc("GET /search/files", indexServer.handleSearchFiles)
+
+	httpServer.Handler = mux
 
 	indexServer.logger.Println("Starting server on", httpServer.Addr)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		indexServer.logger.Fatalf("Failed to start server: %v", err)
-	}
-}
-
-func (s *IndexServer) PeersHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		switch r.URL.Path {
-		case "/peers":
-			s.handleGetAllPeers(w, r)
-		default:
-			// Handle requests like /peers/{ip}/{port}/files
-			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/peers/"), "/")
-			if len(parts) == 3 && parts[2] == "files" {
-				r.SetPathValue("ip", parts[0])
-				r.SetPathValue("port", parts[1])
-				s.handleGetOnePeerFiles(w, r)
-				return
-			}
-
-			http.Error(w, "not found", http.StatusNotFound)
-			s.logger.Printf("Could not handle request: %s %s", r.Method, r.URL.Path)
-		}
-	case http.MethodPost:
-		switch r.URL.Path {
-		case "/peers/announce":
-			s.handlePostPeerAnnounce(w, r)
-		case "/peers/deannounce":
-			s.handlePostPeerDeannounce(w, r)
-		case "/peers/reannounce":
-			s.handlePostPeerReannounce(w, r)
-		default:
-			http.Error(w, "not found", http.StatusNotFound)
-			s.logger.Printf("Could not handle request: %s %s", r.Method, r.URL.Path)
-		}
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		indexServer.logger.Fatalf("Could not listen on %s: %v\n", httpServer.Addr, err)
 	}
 }
 
@@ -236,23 +203,13 @@ func (s *IndexServer) handlePostPeerReannounce(w http.ResponseWriter, r *http.Re
 // upsertPeerAssociations adds/updates a peer's presence and its shared files.
 // Assumes s.mu is already locked.
 func (s *IndexServer) upsertPeerAssociations(peerInfo protocol.PeerInfo) {
-	peerAddr := peerInfo.Address
-	for _, file := range peerInfo.Files {
-		s.fileInfo[file.Checksum] = file
+	s.removePeerAssociations(peerInfo.Address)
 
-		currentPeersForFile := s.files[file.Checksum]
-		exist := false
-		for i, currentPeer := range currentPeersForFile {
-			if currentPeer.Address == peerAddr {
-				exist = true
-				currentPeersForFile[i] = peerInfo
-				break
-			}
+	for _, file := range peerInfo.Files {
+		if _, ok := s.fileInfo[file.Checksum]; !ok {
+			s.fileInfo[file.Checksum] = file
 		}
-		if !exist {
-			currentPeersForFile = append(currentPeersForFile, peerInfo)
-		}
-		s.files[file.Checksum] = currentPeersForFile
+		s.files[file.Checksum] = append(s.files[file.Checksum], protocol.PeerInfo{Address: peerInfo.Address})
 	}
 }
 
@@ -264,7 +221,6 @@ func (s *IndexServer) removePeerAssociations(peerAddr netip.AddrPort) (removedFi
 	for checksum, currentPeersForFile := range s.files {
 		updatedPeersForFile := make([]protocol.PeerInfo, 0, len(currentPeersForFile))
 		peerWasPresent := false
-
 		for _, p := range currentPeersForFile {
 			if p.Address != peerAddr {
 				updatedPeersForFile = append(updatedPeersForFile, p)
@@ -286,65 +242,42 @@ func (s *IndexServer) removePeerAssociations(peerAddr netip.AddrPort) (removedFi
 	return removedFileChecksums
 }
 
-func (s *IndexServer) FilesHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		switch r.URL.Path {
-		case "/files":
-			s.handleGetAllFiles(w, r)
-		default:
-			// Handle requests like /files/{checksum} or /files/{checksum}/peers
-			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/files/"), "/")
-			if len(parts) == 1 {
-				r.SetPathValue("checksum", parts[0])
-				s.handleGetOneFile(w, r)
-				return
-			} else if len(parts) == 2 && parts[1] == "peers" {
-				r.SetPathValue("checksum", parts[0])
-				s.handleGetOneFilePeers(w, r)
-				return
-			}
-
-			http.Error(w, "not found", http.StatusNotFound)
-			s.logger.Printf("Could not handle request: %s %s", r.Method, r.URL.Path)
-		}
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 func (s *IndexServer) handleGetAllFiles(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var files []protocol.FileMeta
+
+	files := make([]protocol.FileMeta, 0, len(s.fileInfo))
 	for _, file := range s.fileInfo {
 		files = append(files, file)
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(files); err != nil {
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
-		s.logger.Printf("Failed to encode response: %v", err)
-		return
+		s.logger.Printf("Error encoding all file metadata: %v", err)
+		http.Error(w, "Failed to encode file metadata list", http.StatusInternalServerError)
 	}
 }
 
 func (s *IndexServer) handleGetOneFile(w http.ResponseWriter, r *http.Request) {
 	checksum := r.PathValue("checksum")
 	if checksum == "" {
-		http.Error(w, "missing checksum in path", http.StatusBadRequest)
+		http.Error(w, "checksum path parameter is required", http.StatusBadRequest)
 		return
 	}
+
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	file, ok := s.fileInfo[checksum]
+	s.mu.RUnlock()
+
 	if !ok {
 		http.Error(w, fmt.Sprintf("file with checksum %s not found", checksum), http.StatusNotFound)
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(file); err != nil {
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
-		s.logger.Printf("Failed to encode response: %v", err)
+		s.logger.Printf("Error encoding file metadata for checksum %s: %v", checksum, err)
+		http.Error(w, "failed to encode file metadata", http.StatusInternalServerError)
 	}
 }
 
@@ -374,23 +307,6 @@ func (s *IndexServer) handleGetOneFilePeers(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "failed to encode response", http.StatusInternalServerError)
 		s.logger.Printf("Failed to encode response: %v", err)
 		return
-	}
-}
-
-func (s *IndexServer) SearchHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		switch r.URL.Path {
-		case "/search":
-			http.Error(w, "search endpoint not implemented", http.StatusNotImplemented)
-		case "/search/files":
-			s.handleSearchFiles(w, r)
-		default:
-			http.Error(w, "not found", http.StatusNotFound)
-			s.logger.Printf("Could not handle request: %s %s", r.Method, r.URL.Path)
-		}
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
