@@ -20,6 +20,12 @@ import (
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
 )
 
+const (
+	maxConcurrentDownloadsPerFile = 5
+	chunkDownloadTimeout          = 60 * time.Second
+	peerConnectTimeout            = 10 * time.Second
+)
+
 // TODO: Implement downloading files in chunks from multiple peers, with progress reporting and connections tracking.
 // TODO: Implement optional secure connections (TLS) for file transfers.
 
@@ -45,6 +51,13 @@ type CorePeer struct {
 	announcedAddr   netip.AddrPort
 	mu              sync.RWMutex
 	logger          *log.Logger
+}
+
+// chunkDownloadResult represents the result of a goroutine worker downloading a single chunk of data.
+type chunkDownloadResult struct {
+	index int
+	data  []byte
+	err   error
 }
 
 // NewCorePeer creates a new CorePeer instance.
@@ -227,14 +240,7 @@ func (p *CorePeer) FetchFileFromIndex(ctx context.Context, fileChecksum string) 
 	return p.indexClient.FetchOneFile(ctx, fileChecksum)
 }
 
-// DownloadFileFromPeer downloads a file from another peer by requesting it chunk by chunk.
-// It requires the full FileMeta of the file to know chunk details.
-func (p *CorePeer) DownloadFileFromPeer(
-	ctx context.Context,
-	peerAddr netip.AddrPort,
-	fileMeta protocol.FileMeta,
-	savePath string,
-) error {
+func (p *CorePeer) DownloadFileFromPeer(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
 	if fileMeta.NumChunks == 0 && fileMeta.Size > 0 {
 		return fmt.Errorf("file metadata indicates non-empty file but zero chunks for %s", fileMeta.Name)
 	}
@@ -242,9 +248,17 @@ func (p *CorePeer) DownloadFileFromPeer(
 		return fmt.Errorf("inconsistent chunk hash count for %s: expected %d, got %d", fileMeta.Name, fileMeta.NumChunks, len(fileMeta.ChunkHashes))
 	}
 
+	peerAddresses, err := p.QueryPeersForFile(ctx, fileMeta.Checksum)
+	if err != nil {
+		return fmt.Errorf("failed to query peers for file %s: %w", fileMeta.Checksum, err)
+	}
+	if len(peerAddresses) == 0 {
+		return fmt.Errorf("no peers found for file %s (checksum: %s)", fileMeta.Name, fileMeta.Checksum)
+	}
+
 	p.logger.Printf(
-		"Starting download of %s (%s, %d chunks) from %s to %s",
-		fileMeta.Name, fileMeta.Checksum, fileMeta.NumChunks, peerAddr, savePath,
+		"Starting parallel download of %s (%s, %d chunks) from %d available peers to %s",
+		fileMeta.Name, fileMeta.Checksum, fileMeta.NumChunks, len(peerAddresses), savePath,
 	)
 
 	file, err := os.Create(savePath)
@@ -257,174 +271,273 @@ func (p *CorePeer) DownloadFileFromPeer(
 		if err := file.Truncate(fileMeta.Size); err != nil {
 			p.logger.Printf("Warning: Failed to pre-allocate file size for %s: %v", savePath, err)
 		}
+	} else {
+		p.logger.Printf("File %s is empty. Download complete.", fileMeta.Name)
+		return nil
 	}
 
-	overallFileHasher := sha256.New()
+	fullFileHasher := sha256.New()
+
+	jobs := make(chan int, fileMeta.NumChunks)
+	results := make(chan chunkDownloadResult, fileMeta.NumChunks)
+
+	var wg sync.WaitGroup
+	numWorkers := min(fileMeta.NumChunks, len(peerAddresses), maxConcurrentDownloadsPerFile)
+
+	for i := range numWorkers {
+		wg.Add(1)
+		go p.downloadChunkWorker(ctx, i, fileMeta, peerAddresses, jobs, results, &wg)
+	}
 
 	for i := range fileMeta.NumChunks {
+		jobs <- i
+	}
+	close(jobs)
+
+	completedChunks := 0
+	downloadErrors := []string{}
+
+	for range fileMeta.NumChunks { // Loop numChunks times because each job must produce a result (data or error)
 		select {
 		case <-ctx.Done():
+			p.logger.Printf("Download context cancelled for %s. Waiting for workers.", fileMeta.Name)
+			go func() {
+				wg.Wait()
+				close(results)
+			}()
+			for res := range results {
+				if res.err != nil {
+					p.logger.Printf("Worker error after cancellation: %v", res.err)
+				}
+			}
 			os.Remove(savePath)
 			return fmt.Errorf("download cancelled for %s: %w", fileMeta.Name, ctx.Err())
+		case res := <-results:
+			if res.err != nil {
+				downloadErrors = append(downloadErrors, fmt.Sprintf("chunk %d: %v", res.index, res.err))
+				// NOTE: For simplicity, first error fails the download. Could implement retries for specific chunks.
+				// TODO: To ensure all workers are shut down, we might need a shared cancellation context.
+				continue
+			}
+
+			currentChunkHasher := sha256.New()
+			currentChunkHasher.Write(res.data)
+			actualChunkChecksum := hex.EncodeToString(currentChunkHasher.Sum(nil))
+
+			if actualChunkChecksum != fileMeta.ChunkHashes[res.index] {
+				errMsg := fmt.Sprintf(
+					"checksum mismatch for chunk %d of %s: expected %s, actual %s",
+					res.index, fileMeta.Name, fileMeta.ChunkHashes[res.index], actualChunkChecksum,
+				)
+				downloadErrors = append(downloadErrors, errMsg)
+				continue
+			}
+
+			offset := int64(res.index) * fileMeta.ChunkSize
+			_, err = file.WriteAt(res.data, offset)
+			if err != nil {
+				downloadErrors = append(downloadErrors, fmt.Sprintf("failed to write chunk %d to file %s: %v", res.index, savePath, err))
+				continue
+			}
+
+			if _, err := fullFileHasher.Write(res.data); err != nil {
+				p.logger.Printf("Error writing chunk %d to overall hasher for %s: %v", res.index, fileMeta.Name, err)
+			}
+			completedChunks++
+			p.logger.Printf("Successfully downloaded, verified, and wrote chunk %d for %s", res.index, fileMeta.Name)
+		}
+	}
+
+	if len(downloadErrors) > 0 {
+		os.Remove(savePath)
+		return fmt.Errorf("failed to download file %s due to %d errors: %s", fileMeta.Name, len(downloadErrors), strings.Join(downloadErrors, "; "))
+	}
+
+	if completedChunks != fileMeta.NumChunks {
+		os.Remove(savePath)
+		return fmt.Errorf("download incomplete for %s: expected %d chunks, got %d", fileMeta.Name, fileMeta.NumChunks, completedChunks)
+	}
+
+	receivedFullChecksum := hex.EncodeToString(fullFileHasher.Sum(nil))
+	if receivedFullChecksum != fileMeta.Checksum {
+		os.Remove(savePath)
+		return fmt.Errorf(
+			"overall checksum mismatch for %s: expected %s, actual %s",
+			fileMeta.Name, fileMeta.Checksum, receivedFullChecksum,
+		)
+	}
+	p.logger.Printf("Overall file checksum verified for %s", fileMeta.Name)
+
+	p.logger.Printf(
+		"Successfully downloaded and verified all %d chunks for file %s to %s using %d workers",
+		fileMeta.NumChunks, fileMeta.Name, savePath, numWorkers,
+	)
+	return nil
+}
+
+func (p *CorePeer) downloadChunkWorker(
+	ctx context.Context,
+	workerID int,
+	fileMeta protocol.FileMeta,
+	peerAddresses []netip.AddrPort,
+	jobs <-chan int,
+	results chan<- chunkDownloadResult,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+	p.logger.Printf("Worker %d started for file %s", workerID, fileMeta.Name)
+
+	for chunkIndex := range jobs {
+		select {
+		case <-ctx.Done():
+			p.logger.Printf("Worker %d: context cancelled before processing chunk %d for %s.", workerID, chunkIndex, fileMeta.Name)
+			results <- chunkDownloadResult{index: chunkIndex, err: ctx.Err()}
+			return
 		default:
 		}
 
-		p.logger.Printf("Downloading chunk %d/%d for %s from %s", i+1, fileMeta.NumChunks, fileMeta.Name, peerAddr)
+		p.logger.Printf("Worker %d: attempting to download chunk %d for %s", workerID, chunkIndex, fileMeta.Name)
 
-		conn, err := net.DialTimeout("tcp", peerAddr.String(), 10*time.Second)
+		var downloadedData []byte
+		var downloadErr error
+
+		// NOTE: Current implementation uses simple round-robin peer selection based on chunk index.
+		// TODO: Implement retry logic with different peers when chunk download fails from selected peer.
+		peerIdx := chunkIndex % len(peerAddresses)
+		selectedPeerAddr := peerAddresses[peerIdx]
+
+		p.logger.Printf(
+			"Worker %d: chunk %d assigned to peer %s for %s",
+			workerID, chunkIndex, selectedPeerAddr.String(), fileMeta.Name,
+		)
+
+		conn, err := net.DialTimeout("tcp", selectedPeerAddr.String(), peerConnectTimeout)
 		if err != nil {
-			os.Remove(savePath)
-			return fmt.Errorf("failed to connect to peer %s for chunk %d: %w", peerAddr, i, err)
+			downloadErr = fmt.Errorf("worker %d: failed to connect to peer %s for chunk %d of %s: %w", workerID, selectedPeerAddr, chunkIndex, fileMeta.Name, err)
+			results <- chunkDownloadResult{index: chunkIndex, data: nil, err: downloadErr}
+			continue
 		}
 
-		writer := bufio.NewWriter(conn)
-		reader := bufio.NewReader(conn)
+		func() { // Anonymous func for scoping defer conn.Close()
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(chunkDownloadTimeout))
 
-		if _, err := writer.Write([]byte{byte(protocol.CHUNK_REQUEST)}); err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to write CHUNK_REQUEST type for chunk %d: %w", i, err)
-		}
-		if _, err := writer.WriteString(fileMeta.Checksum + "\n"); err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to write file checksum for chunk %d: %w", i, err)
-		}
-		if _, err := writer.WriteString(strconv.Itoa(i) + "\n"); err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to write chunk index %d: %w", i, err)
-		}
-		if err := writer.Flush(); err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to flush CHUNK_REQUEST for chunk %d: %w", i, err)
-		}
+			writer := bufio.NewWriter(conn)
+			reader := bufio.NewReader(conn)
 
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if _, err := writer.Write([]byte{byte(protocol.CHUNK_REQUEST)}); err != nil {
+				downloadErr = fmt.Errorf("worker %d: failed to write CHUNK_REQUEST type for chunk %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
+				return
+			}
+			if _, err := writer.WriteString(fileMeta.Checksum + "\n"); err != nil {
+				downloadErr = fmt.Errorf("worker %d: failed to write file checksum for chunk %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
+				return
+			}
+			if _, err := writer.WriteString(strconv.Itoa(chunkIndex) + "\n"); err != nil {
+				downloadErr = fmt.Errorf("worker %d: failed to write chunk index %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
+				return
+			}
+			if err := writer.Flush(); err != nil {
+				downloadErr = fmt.Errorf("worker %d: failed to flush CHUNK_REQUEST for chunk %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
+				return
+			}
 
-		msgTypeByte, err := reader.ReadByte()
-		if err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to read response type for chunk %d: %w", i, err)
-		}
+			msgTypeByte, err := reader.ReadByte()
+			if err != nil {
+				downloadErr = fmt.Errorf("worker %d: failed to read response type for chunk %d from %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
+				return
+			}
 
-		if protocol.MessageType(msgTypeByte) == protocol.ERROR {
-			errMsg, _ := reader.ReadString('\n')
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("peer returned error for chunk %d: %s", i, strings.TrimSpace(errMsg))
-		}
+			if protocol.MessageType(msgTypeByte) == protocol.ERROR {
+				errMsg, _ := reader.ReadString('\n')
+				downloadErr = fmt.Errorf("worker %d: peer %s returned error for chunk %d of %s: %s", workerID, selectedPeerAddr, chunkIndex, fileMeta.Name, strings.TrimSpace(errMsg))
+				return
+			}
+			if protocol.MessageType(msgTypeByte) != protocol.CHUNK_DATA {
+				downloadErr = fmt.Errorf("worker %d: unexpected response type %d for chunk %d from %s", workerID, msgTypeByte, chunkIndex, selectedPeerAddr)
+				return
+			}
 
-		if protocol.MessageType(msgTypeByte) != protocol.CHUNK_DATA {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("unexpected response type %d for chunk %d", msgTypeByte, i)
-		}
+			respFileChecksum, err := reader.ReadString('\n')
+			if err != nil {
+				downloadErr = fmt.Errorf(
+					"worker %d: failed to read response file checksum for chunk %d from %s: %w",
+					workerID, chunkIndex, selectedPeerAddr, err,
+				)
+				return
+			}
+			if strings.TrimSpace(respFileChecksum) != fileMeta.Checksum {
+				downloadErr = fmt.Errorf(
+					"worker %d: checksum mismatch in response for chunk %d from %s: expected %s, got %s",
+					workerID, chunkIndex, selectedPeerAddr, fileMeta.Checksum, strings.TrimSpace(respFileChecksum),
+				)
+				return
+			}
 
-		respFileChecksum, err := reader.ReadString('\n')
-		if err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to read response file checksum for chunk %d: %w", i, err)
-		}
-		respFileChecksum = strings.TrimSpace(respFileChecksum)
-		if respFileChecksum != fileMeta.Checksum {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("checksum mismatch in response for chunk %d: expected %s, got %s", i, fileMeta.Checksum, respFileChecksum)
-		}
+			respChunkIndexStr, err := reader.ReadString('\n')
+			if err != nil {
+				downloadErr = fmt.Errorf(
+					"worker %d: failed to read response chunk index for chunk %d from %s: %w",
+					workerID, chunkIndex, selectedPeerAddr, err,
+				)
+				return
+			}
+			respChunkIndex, err := strconv.Atoi(strings.TrimSpace(respChunkIndexStr))
+			if err != nil || respChunkIndex != chunkIndex {
+				downloadErr = fmt.Errorf(
+					"worker %d: chunk index mismatch in response for chunk %d from %s: expected %d, got %s (%v)",
+					workerID, chunkIndex, selectedPeerAddr, chunkIndex, strings.TrimSpace(respChunkIndexStr), err,
+				)
+				return
+			}
 
-		respChunkIndexStr, err := reader.ReadString('\n')
-		if err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to read response chunk index for chunk %d: %w", i, err)
-		}
-		respChunkIndex, err := strconv.Atoi(strings.TrimSpace(respChunkIndexStr))
-		if err != nil || respChunkIndex != i {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf(
-				"chunk index mismatch in response for chunk %d: expected %d, got %s (%v)",
-				i, i, respChunkIndexStr, err,
-			)
-		}
+			chunkLengthStr, err := reader.ReadString('\n')
+			if err != nil {
+				downloadErr = fmt.Errorf(
+					"worker %d: failed to read chunk length for chunk %d from %s: %w",
+					workerID, chunkIndex, selectedPeerAddr, err,
+				)
+				return
+			}
+			chunkLength, err := strconv.ParseInt(strings.TrimSpace(chunkLengthStr), 10, 64)
+			if err != nil {
+				downloadErr = fmt.Errorf(
+					"worker %d: invalid chunk length '%s' for chunk %d from %s: %w",
+					workerID, strings.TrimSpace(chunkLengthStr), chunkIndex, selectedPeerAddr, err,
+				)
+				return
+			}
 
-		chunkLengthStr, err := reader.ReadString('\n')
-		if err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to read chunk length for chunk %d: %w", i, err)
-		}
-		chunkLength, err := strconv.ParseInt(strings.TrimSpace(chunkLengthStr), 10, 64)
-		if err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("invalid chunk length '%s' for chunk %d: %w", chunkLengthStr, i, err)
-		}
-		if chunkLength <= 0 || chunkLength > fileMeta.ChunkSize {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("invalid chunk length %d for chunk %d (max %d)", chunkLength, i, fileMeta.ChunkSize)
-		}
+			expectedChunkSize := fileMeta.ChunkSize
+			if chunkIndex == fileMeta.NumChunks-1 {
+				if remainder := fileMeta.Size % fileMeta.ChunkSize; remainder != 0 {
+					expectedChunkSize = remainder
+				}
+			}
+			if chunkLength <= 0 || chunkLength > fileMeta.ChunkSize || chunkLength != expectedChunkSize {
+				downloadErr = fmt.Errorf(
+					"worker %d: invalid chunk data length %d for chunk %d from %s (expected %d, max %d)",
+					workerID, chunkLength, chunkIndex, selectedPeerAddr, expectedChunkSize, fileMeta.ChunkSize,
+				)
+				return
+			}
 
-		chunkData := make([]byte, chunkLength)
-		n, err := io.ReadFull(reader, chunkData)
-		if err != nil {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("failed to read chunk %d data (expected %d bytes): %w", i, chunkLength, err)
-		}
-		if int64(n) != chunkLength {
-			conn.Close()
-			os.Remove(savePath)
-			return fmt.Errorf("incomplete chunk %d data: read %d, expected %d", i, n, chunkLength)
-		}
-		conn.Close()
+			data := make([]byte, chunkLength)
+			n, err := io.ReadFull(reader, data)
+			if err != nil {
+				downloadErr = fmt.Errorf("worker %d: failed to read chunk %d data (expected %d bytes) from %s: %w", workerID, chunkIndex, chunkLength, selectedPeerAddr, err)
+				return
+			}
+			if int64(n) != chunkLength {
+				downloadErr = fmt.Errorf("worker %d: incomplete chunk %d data from %s: read %d, expected %d", workerID, chunkIndex, selectedPeerAddr, n, chunkLength)
+				return
+			}
+			downloadedData = data
+		}()
 
-		// Debugging line to save chunk data. Fire corrupted in transit confirmed.
-		os.WriteFile("/home/darkroom/chunk_data.jpg", chunkData, 0o644)
-
-		currentChunkHasher := sha256.New()
-		currentChunkHasher.Write(chunkData)
-		actualChunkChecksum := hex.EncodeToString(currentChunkHasher.Sum(nil))
-
-		if actualChunkChecksum != fileMeta.ChunkHashes[i] {
-			os.Remove(savePath)
-			return fmt.Errorf(
-				"checksum mismatch for chunk %d of %s: expected %s, actual %s",
-				i+1, fileMeta.Name, fileMeta.ChunkHashes[i], actualChunkChecksum,
-			)
-		}
-
-		offset := int64(i) * fileMeta.ChunkSize
-		_, err = file.WriteAt(chunkData, offset)
-		if err != nil {
-			os.Remove(savePath)
-			return fmt.Errorf("failed to write chunk %d to file %s: %w", i, savePath, err)
-		}
-
-		if _, err := overallFileHasher.Write(chunkData); err != nil {
-			p.logger.Printf("Error writing chunk to overall hasher: %v", err)
-		}
-		p.logger.Printf("Successfully downloaded and verified chunk %d for %s", i, fileMeta.Name)
+		results <- chunkDownloadResult{index: chunkIndex, data: downloadedData, err: downloadErr}
 	}
-
-	if fileMeta.Size > 0 {
-		actualOverallChecksum := hex.EncodeToString(overallFileHasher.Sum(nil))
-		if actualOverallChecksum != fileMeta.Checksum {
-			os.Remove(savePath)
-			return fmt.Errorf("overall checksum mismatch for %s: expected %s, actual %s", fileMeta.Name, fileMeta.Checksum, actualOverallChecksum)
-		}
-		p.logger.Printf("Overall file checksum verified for %s", fileMeta.Name)
-	} else {
-		p.logger.Printf("File %s is empty, skipping final overall checksum verification.", fileMeta.Name)
-	}
-
-	p.logger.Printf("Successfully downloaded and verified all %d chunks for file %s to %s", fileMeta.NumChunks, fileMeta.Name, savePath)
-	return nil
+	p.logger.Printf("Worker %d finished for file %s", workerID, fileMeta.Name)
 }
 
 // acceptConnections starts the TCP file server and handles incoming connections.

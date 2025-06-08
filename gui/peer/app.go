@@ -179,10 +179,7 @@ func (a *App) FetchPeersForFile(checksum string) ([]netip.AddrPort, error) {
 	return peers, nil
 }
 
-func (a *App) DownloadFileWithDialog(
-	peerAddrPort netip.AddrPort,
-	fileChecksum, fileName string,
-) (string, error) {
+func (a *App) DownloadFileWithDialog(fileChecksum, fileName string) (string, error) {
 	if a.corePeer == nil {
 		return "", fmt.Errorf("CorePeer not initialized")
 	}
@@ -199,7 +196,7 @@ func (a *App) DownloadFileWithDialog(
 
 	saveDir, err := wruntime.SaveFileDialog(a.ctx, wruntime.SaveDialogOptions{
 		Title:           "Save Downloaded File",
-		DefaultFilename: fileName,
+		DefaultFilename: fileMeta.Name,
 	})
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to choose save location: %v", err)
@@ -212,11 +209,11 @@ func (a *App) DownloadFileWithDialog(
 
 	wruntime.LogInfof(
 		a.ctx,
-		"[peer] Attempting to download file %s (checksum: %s) from %s to %s using chunk method",
-		fileMeta.Name, fileMeta.Checksum, peerAddrPort.String(), saveDir,
+		"[peer] Attempting to download file %s (checksum: %s) to %s",
+		fileMeta.Name, fileMeta.Checksum, saveDir,
 	)
 
-	err = a.corePeer.DownloadFileFromPeer(a.ctx, peerAddrPort, fileMeta, saveDir)
+	err = a.corePeer.DownloadFileFromPeer(a.ctx, fileMeta, saveDir)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file %s: %v", fileMeta.Name, err)
 		return "", fmt.Errorf("failed to download file %s: %w", fileMeta.Name, err)

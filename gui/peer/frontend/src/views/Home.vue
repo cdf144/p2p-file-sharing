@@ -148,11 +148,8 @@ async function downloadFile(file: protocol.FileMeta) {
             return;
         }
 
-        // TODO: Implement parallel download of chunks from multiple peers
-        const selectedPeerAddress = peers[0];
-
         peerState.statusMessage = `Downloading ${file.name} from peer...`;
-        const result = await DownloadFileWithDialog(selectedPeerAddress, file.checksum, file.name);
+        const result = await DownloadFileWithDialog(file.checksum, file.name);
         peerState.statusMessage = result;
     } catch (error: any) {
         LogError(`Error in download process for ${file.name}: ${error}`);
