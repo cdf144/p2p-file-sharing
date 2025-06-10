@@ -63,11 +63,12 @@ type chunkDownloadResult struct {
 // NewCorePeer creates a new CorePeer instance.
 func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 	logger := log.New(log.Writer(), "[corepeer] ", log.LstdFlags|log.Lmsgprefix)
-	return &CorePeer{
-		config:      cfg,
+	corePeer := &CorePeer{
 		logger:      logger,
 		indexClient: NewIndexClient(cfg.IndexURL, logger),
 	}
+	corePeer.UpdateConfig(context.Background(), cfg)
+	return corePeer
 }
 
 // Start initializes and starts the CorePeer service, making it ready to share files and participate in the P2P network.

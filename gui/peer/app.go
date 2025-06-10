@@ -30,7 +30,12 @@ func NewApp() *App {
 // so we can call the runtime methods
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	a.corePeer = corepeer.NewCorePeer(corepeer.CorePeerConfig{})
+	a.corePeer = corepeer.NewCorePeer(corepeer.CorePeerConfig{
+		IndexURL:   "http://localhost:9090",
+		ShareDir:   "",
+		ServePort:  0,
+		PublicPort: 0,
+	})
 	wruntime.LogInfo(ctx, "[peer] Application started. CorePeer initialized.")
 }
 
