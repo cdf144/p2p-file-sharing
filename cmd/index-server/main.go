@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,9 +24,17 @@ type IndexServer struct {
 	logger   *log.Logger
 }
 
+var httpServerPort int
+
 func main() {
+	flag.IntVar(&httpServerPort, "port", 9090, "Port to run the index server on")
+	flag.Parse()
+	if !(0 < httpServerPort && httpServerPort <= 65535) {
+		log.Fatalf("Invalid port number: %d. Must be between 1 and 65535.", httpServerPort)
+	}
+
 	httpServer := http.Server{
-		Addr:           ":9090",
+		Addr:           fmt.Sprintf(":%d", httpServerPort),
 		ReadTimeout:    5 * time.Second,
 		WriteTimeout:   5 * time.Second,
 		MaxHeaderBytes: 1 << 20, // 1 MB
