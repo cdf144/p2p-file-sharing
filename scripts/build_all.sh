@@ -18,6 +18,12 @@ fi
 echo "peer CLI built successfully: dist/peer-cli"
 
 echo ""
+if ! command -v wails &> /dev/null
+then
+    echo "Wails CLI could not be found. Please install Wails: https://wails.io/docs/gettingstarted/installation"
+    exit 1
+fi
+
 echo "Building peer GUI..."
 (cd gui/peer && wails build -clean)
 if [ $? -ne 0 ]; then
