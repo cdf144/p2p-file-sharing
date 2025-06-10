@@ -247,7 +247,10 @@ func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta,
 		return fmt.Errorf("file metadata indicates non-empty file but zero chunks for %s", fileMeta.Name)
 	}
 	if fileMeta.NumChunks > 0 && len(fileMeta.ChunkHashes) != fileMeta.NumChunks {
-		return fmt.Errorf("inconsistent chunk hash count for %s: expected %d, got %d", fileMeta.Name, fileMeta.NumChunks, len(fileMeta.ChunkHashes))
+		return fmt.Errorf(
+			"inconsistent chunk hash count for %s: expected %d, got %d",
+			fileMeta.Name, fileMeta.NumChunks, len(fileMeta.ChunkHashes),
+		)
 	}
 
 	peerAddresses, err := p.QueryPeersForFile(ctx, fileMeta.Checksum)
@@ -277,8 +280,6 @@ func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta,
 		p.logger.Printf("File %s is empty. Download complete.", fileMeta.Name)
 		return nil
 	}
-
-	fullFileHasher := sha256.New()
 
 	jobs := make(chan int, fileMeta.NumChunks)
 	results := make(chan chunkDownloadResult, fileMeta.NumChunks)
@@ -338,13 +339,13 @@ func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta,
 			offset := int64(res.index) * fileMeta.ChunkSize
 			_, err = file.WriteAt(res.data, offset)
 			if err != nil {
-				downloadErrors = append(downloadErrors, fmt.Sprintf("failed to write chunk %d to file %s: %v", res.index, savePath, err))
+				downloadErrors = append(downloadErrors, fmt.Sprintf(
+					"failed to write chunk %d to file %s: %v",
+					res.index, savePath, err,
+				))
 				continue
 			}
 
-			if _, err := fullFileHasher.Write(res.data); err != nil {
-				p.logger.Printf("Error writing chunk %d to overall hasher for %s: %v", res.index, fileMeta.Name, err)
-			}
 			completedChunks++
 			p.logger.Printf("Successfully downloaded, verified, and wrote chunk %d for %s", res.index, fileMeta.Name)
 		}
@@ -359,6 +360,23 @@ func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta,
 		os.Remove(savePath)
 		return fmt.Errorf("download incomplete for %s: expected %d chunks, got %d", fileMeta.Name, fileMeta.NumChunks, completedChunks)
 	}
+
+	if err := file.Sync(); err != nil {
+		p.logger.Printf("Warning: failed to sync file %s to disk: %v. Checksum verification might use cached data.", savePath, err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		os.Remove(savePath)
+		return fmt.Errorf("failed to seek to start of file %s for final hashing: %w", savePath, err)
+	}
+
+	fullFileHasher := sha256.New()
+	if _, err := io.Copy(fullFileHasher, file); err != nil {
+		file.Close()
+		os.Remove(savePath)
+		return fmt.Errorf("failed to read file %s for final hashing: %w", savePath, err)
+	}
+	file.Close()
 
 	receivedFullChecksum := hex.EncodeToString(fullFileHasher.Sum(nil))
 	if receivedFullChecksum != fileMeta.Checksum {
