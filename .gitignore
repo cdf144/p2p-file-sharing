@@ -5,6 +5,9 @@
 *.so
 *.dylib
 
+# Build outputs
+dist
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -28,3 +31,9 @@ go.work.sum
 !.vscode/launch.json
 !.vscode/extensions.json
 !.vscode/*.code-snippets
+
+# Node.js
+node_modules
+
+# Wails
+**/build/bin
