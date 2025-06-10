@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/netip"
 	"os"
@@ -241,7 +242,7 @@ func (p *CorePeer) FetchFileFromIndex(ctx context.Context, fileChecksum string) 
 	return p.indexClient.FetchOneFile(ctx, fileChecksum)
 }
 
-func (p *CorePeer) DownloadFileFromPeer(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
+func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
 	if fileMeta.NumChunks == 0 && fileMeta.Size > 0 {
 		return fmt.Errorf("file metadata indicates non-empty file but zero chunks for %s", fileMeta.Name)
 	}
@@ -388,10 +389,21 @@ func (p *CorePeer) downloadChunkWorker(
 	defer wg.Done()
 	p.logger.Printf("Worker %d started for file %s", workerID, fileMeta.Name)
 
+	candidatePeers := make([]netip.AddrPort, len(peerAddresses))
+	copy(candidatePeers, peerAddresses)
+	rSeed := time.Now().UnixNano() + int64(workerID)
+	r := rand.New(rand.NewSource(rSeed))
+	r.Shuffle(len(candidatePeers), func(i, j int) {
+		candidatePeers[i], candidatePeers[j] = candidatePeers[j], candidatePeers[i]
+	})
+
 	for chunkIndex := range jobs {
 		select {
 		case <-ctx.Done():
-			p.logger.Printf("Worker %d: context cancelled before processing chunk %d for %s.", workerID, chunkIndex, fileMeta.Name)
+			p.logger.Printf(
+				"Worker %d: context cancelled before processing chunk %d for %s.",
+				workerID, chunkIndex, fileMeta.Name,
+			)
 			results <- chunkDownloadResult{index: chunkIndex, err: ctx.Err()}
 			return
 		default:
@@ -401,141 +413,212 @@ func (p *CorePeer) downloadChunkWorker(
 
 		var downloadedData []byte
 		var downloadErr error
+		success := false
 
-		// NOTE: Current implementation uses simple round-robin peer selection based on chunk index.
-		// TODO: Implement retry logic with different peers when chunk download fails from selected peer.
-		peerIdx := chunkIndex % len(peerAddresses)
-		selectedPeerAddr := peerAddresses[peerIdx]
+		for _, selectedPeerAddr := range candidatePeers {
+			select {
+			case <-ctx.Done():
+				p.logger.Printf(
+					"Worker %d: context cancelled while selecting peer for chunk %d of %s.",
+					workerID, chunkIndex, fileMeta.Name,
+				)
+				if downloadErr == nil {
+					downloadErr = ctx.Err()
+				}
+				success = false
+				goto reportResult
+			default:
+			}
 
-		p.logger.Printf(
-			"Worker %d: chunk %d assigned to peer %s for %s",
-			workerID, chunkIndex, selectedPeerAddr.String(), fileMeta.Name,
-		)
+			p.logger.Printf(
+				"Worker %d: attempting chunk %d from peer %s for %s",
+				workerID, chunkIndex, selectedPeerAddr.String(), fileMeta.Name,
+			)
 
-		conn, err := net.DialTimeout("tcp", selectedPeerAddr.String(), peerConnectTimeout)
-		if err != nil {
-			downloadErr = fmt.Errorf("worker %d: failed to connect to peer %s for chunk %d of %s: %w", workerID, selectedPeerAddr, chunkIndex, fileMeta.Name, err)
-			results <- chunkDownloadResult{index: chunkIndex, data: nil, err: downloadErr}
-			continue
+			conn, err := net.DialTimeout("tcp", selectedPeerAddr.String(), peerConnectTimeout)
+			if err != nil {
+				downloadErr = fmt.Errorf(
+					"worker %d: failed to connect to peer %s for chunk %d of %s: %w",
+					workerID, selectedPeerAddr, chunkIndex, fileMeta.Name, err,
+				)
+				p.logger.Printf("%v", downloadErr)
+				continue
+			}
+
+			// Anonymous function for scoping defer conn.Close() and collecting processed data/error
+			chunkData, chunkErr := func() ([]byte, error) {
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(chunkDownloadTimeout))
+
+				writer := bufio.NewWriter(conn)
+				reader := bufio.NewReader(conn)
+
+				if _, err := writer.Write([]byte{byte(protocol.CHUNK_REQUEST)}); err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to write CHUNK_REQUEST type for chunk %d to %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+				if _, err := writer.WriteString(fileMeta.Checksum + "\n"); err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to write file checksum for chunk %d to %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+				if _, err := writer.WriteString(strconv.Itoa(chunkIndex) + "\n"); err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to write chunk index %d to %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+				if err := writer.Flush(); err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to flush CHUNK_REQUEST for chunk %d to %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+
+				msgTypeByte, err := reader.ReadByte()
+				if err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to read response type for chunk %d from %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+
+				if protocol.MessageType(msgTypeByte) == protocol.ERROR {
+					errMsg, _ := reader.ReadString('\n')
+					return nil, fmt.Errorf(
+						"worker %d: peer %s returned error for chunk %d of %s: %s",
+						workerID, selectedPeerAddr, chunkIndex, fileMeta.Name, strings.TrimSpace(errMsg),
+					)
+				}
+				if protocol.MessageType(msgTypeByte) != protocol.CHUNK_DATA {
+					return nil, fmt.Errorf(
+						"worker %d: unexpected response type %d for chunk %d from %s",
+						workerID, msgTypeByte, chunkIndex, selectedPeerAddr,
+					)
+				}
+
+				respFileChecksum, err := reader.ReadString('\n')
+				if err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to read response file checksum for chunk %d from %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+				if strings.TrimSpace(respFileChecksum) != fileMeta.Checksum {
+					return nil, fmt.Errorf(
+						"worker %d: checksum mismatch in response for chunk %d from %s: expected %s, got %s",
+						workerID, chunkIndex, selectedPeerAddr, fileMeta.Checksum, strings.TrimSpace(respFileChecksum),
+					)
+				}
+
+				respChunkIndexStr, err := reader.ReadString('\n')
+				if err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to read response chunk index for chunk %d from %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+				respChunkIndex, err := strconv.Atoi(strings.TrimSpace(respChunkIndexStr))
+				if err != nil || respChunkIndex != chunkIndex {
+					return nil, fmt.Errorf(
+						"worker %d: chunk index mismatch in response for chunk %d from %s: expected %d, got %s (%v)",
+						workerID, chunkIndex, selectedPeerAddr, chunkIndex, strings.TrimSpace(respChunkIndexStr), err,
+					)
+				}
+
+				chunkLengthStr, err := reader.ReadString('\n')
+				if err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: failed to read chunk length for chunk %d from %s: %w",
+						workerID, chunkIndex, selectedPeerAddr, err,
+					)
+				}
+				chunkLength, err := strconv.ParseInt(strings.TrimSpace(chunkLengthStr), 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf(
+						"worker %d: invalid chunk length '%s' for chunk %d from %s: %w",
+						workerID, strings.TrimSpace(chunkLengthStr), chunkIndex, selectedPeerAddr, err,
+					)
+				}
+
+				expectedChunkSize := fileMeta.ChunkSize
+				if chunkIndex == fileMeta.NumChunks-1 {
+					if remainder := fileMeta.Size % fileMeta.ChunkSize; remainder != 0 {
+						expectedChunkSize = remainder
+					}
+				}
+
+				if chunkLength < 0 || chunkLength > fileMeta.ChunkSize || chunkLength != expectedChunkSize {
+					if !(chunkLength == 0 && expectedChunkSize == 0) {
+						return nil, fmt.Errorf(
+							"worker %d: invalid chunk data length %d for chunk %d from %s (expected %d, max %d)",
+							workerID, chunkLength, chunkIndex, selectedPeerAddr, expectedChunkSize, fileMeta.ChunkSize,
+						)
+					}
+				}
+
+				data := make([]byte, chunkLength)
+				n, err := io.ReadFull(reader, data)
+				if err != nil {
+					return nil, fmt.Errorf("worker %d: failed to read chunk %d data (expected %d bytes) from %s: %w", workerID, chunkIndex, chunkLength, selectedPeerAddr, err)
+				}
+				if int64(n) != chunkLength {
+					return nil, fmt.Errorf("worker %d: incomplete chunk %d data from %s: read %d, expected %d", workerID, chunkIndex, selectedPeerAddr, n, chunkLength)
+				}
+				return data, nil
+			}()
+
+			if chunkErr != nil {
+				downloadErr = chunkErr
+				p.logger.Printf(
+					"Worker %d: error downloading chunk %d from peer %s: %v",
+					workerID, chunkIndex, selectedPeerAddr, downloadErr,
+				)
+				select {
+				case <-ctx.Done():
+					p.logger.Printf(
+						"Worker %d: context cancelled after error with peer %s for chunk %d.",
+						workerID, selectedPeerAddr, chunkIndex,
+					)
+					downloadErr = ctx.Err()
+					success = false
+					goto reportResult
+				default:
+				}
+				continue
+			}
+
+			downloadedData = chunkData
+			success = true
+			p.logger.Printf(
+				"Worker %d: successfully downloaded chunk %d from peer %s for %s",
+				workerID, chunkIndex, selectedPeerAddr, fileMeta.Name,
+			)
+			break
 		}
 
-		func() { // Anonymous func for scoping defer conn.Close()
-			defer conn.Close()
-			conn.SetDeadline(time.Now().Add(chunkDownloadTimeout))
-
-			writer := bufio.NewWriter(conn)
-			reader := bufio.NewReader(conn)
-
-			if _, err := writer.Write([]byte{byte(protocol.CHUNK_REQUEST)}); err != nil {
-				downloadErr = fmt.Errorf("worker %d: failed to write CHUNK_REQUEST type for chunk %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
-				return
-			}
-			if _, err := writer.WriteString(fileMeta.Checksum + "\n"); err != nil {
-				downloadErr = fmt.Errorf("worker %d: failed to write file checksum for chunk %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
-				return
-			}
-			if _, err := writer.WriteString(strconv.Itoa(chunkIndex) + "\n"); err != nil {
-				downloadErr = fmt.Errorf("worker %d: failed to write chunk index %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
-				return
-			}
-			if err := writer.Flush(); err != nil {
-				downloadErr = fmt.Errorf("worker %d: failed to flush CHUNK_REQUEST for chunk %d to %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
-				return
-			}
-
-			msgTypeByte, err := reader.ReadByte()
-			if err != nil {
-				downloadErr = fmt.Errorf("worker %d: failed to read response type for chunk %d from %s: %w", workerID, chunkIndex, selectedPeerAddr, err)
-				return
-			}
-
-			if protocol.MessageType(msgTypeByte) == protocol.ERROR {
-				errMsg, _ := reader.ReadString('\n')
-				downloadErr = fmt.Errorf("worker %d: peer %s returned error for chunk %d of %s: %s", workerID, selectedPeerAddr, chunkIndex, fileMeta.Name, strings.TrimSpace(errMsg))
-				return
-			}
-			if protocol.MessageType(msgTypeByte) != protocol.CHUNK_DATA {
-				downloadErr = fmt.Errorf("worker %d: unexpected response type %d for chunk %d from %s", workerID, msgTypeByte, chunkIndex, selectedPeerAddr)
-				return
-			}
-
-			respFileChecksum, err := reader.ReadString('\n')
-			if err != nil {
-				downloadErr = fmt.Errorf(
-					"worker %d: failed to read response file checksum for chunk %d from %s: %w",
-					workerID, chunkIndex, selectedPeerAddr, err,
-				)
-				return
-			}
-			if strings.TrimSpace(respFileChecksum) != fileMeta.Checksum {
-				downloadErr = fmt.Errorf(
-					"worker %d: checksum mismatch in response for chunk %d from %s: expected %s, got %s",
-					workerID, chunkIndex, selectedPeerAddr, fileMeta.Checksum, strings.TrimSpace(respFileChecksum),
-				)
-				return
-			}
-
-			respChunkIndexStr, err := reader.ReadString('\n')
-			if err != nil {
-				downloadErr = fmt.Errorf(
-					"worker %d: failed to read response chunk index for chunk %d from %s: %w",
-					workerID, chunkIndex, selectedPeerAddr, err,
-				)
-				return
-			}
-			respChunkIndex, err := strconv.Atoi(strings.TrimSpace(respChunkIndexStr))
-			if err != nil || respChunkIndex != chunkIndex {
-				downloadErr = fmt.Errorf(
-					"worker %d: chunk index mismatch in response for chunk %d from %s: expected %d, got %s (%v)",
-					workerID, chunkIndex, selectedPeerAddr, chunkIndex, strings.TrimSpace(respChunkIndexStr), err,
-				)
-				return
-			}
-
-			chunkLengthStr, err := reader.ReadString('\n')
-			if err != nil {
-				downloadErr = fmt.Errorf(
-					"worker %d: failed to read chunk length for chunk %d from %s: %w",
-					workerID, chunkIndex, selectedPeerAddr, err,
-				)
-				return
-			}
-			chunkLength, err := strconv.ParseInt(strings.TrimSpace(chunkLengthStr), 10, 64)
-			if err != nil {
-				downloadErr = fmt.Errorf(
-					"worker %d: invalid chunk length '%s' for chunk %d from %s: %w",
-					workerID, strings.TrimSpace(chunkLengthStr), chunkIndex, selectedPeerAddr, err,
-				)
-				return
-			}
-
-			expectedChunkSize := fileMeta.ChunkSize
-			if chunkIndex == fileMeta.NumChunks-1 {
-				if remainder := fileMeta.Size % fileMeta.ChunkSize; remainder != 0 {
-					expectedChunkSize = remainder
+	reportResult:
+		if !success {
+			if downloadErr == nil {
+				if ctx.Err() != nil {
+					downloadErr = ctx.Err()
+				} else {
+					downloadErr = fmt.Errorf(
+						"worker %d: failed to download chunk %d from any available peer for %s",
+						workerID, chunkIndex, fileMeta.Name,
+					)
 				}
 			}
-			if chunkLength <= 0 || chunkLength > fileMeta.ChunkSize || chunkLength != expectedChunkSize {
-				downloadErr = fmt.Errorf(
-					"worker %d: invalid chunk data length %d for chunk %d from %s (expected %d, max %d)",
-					workerID, chunkLength, chunkIndex, selectedPeerAddr, expectedChunkSize, fileMeta.ChunkSize,
+			if ctx.Err() == nil {
+				p.logger.Printf(
+					"Worker %d: failed to download chunk %d for %s after trying all peers. Last error: %v",
+					workerID, chunkIndex, fileMeta.Name, downloadErr,
 				)
-				return
 			}
-
-			data := make([]byte, chunkLength)
-			n, err := io.ReadFull(reader, data)
-			if err != nil {
-				downloadErr = fmt.Errorf("worker %d: failed to read chunk %d data (expected %d bytes) from %s: %w", workerID, chunkIndex, chunkLength, selectedPeerAddr, err)
-				return
-			}
-			if int64(n) != chunkLength {
-				downloadErr = fmt.Errorf("worker %d: incomplete chunk %d data from %s: read %d, expected %d", workerID, chunkIndex, selectedPeerAddr, n, chunkLength)
-				return
-			}
-			downloadedData = data
-		}()
-
+		}
 		results <- chunkDownloadResult{index: chunkIndex, data: downloadedData, err: downloadErr}
 	}
 	p.logger.Printf("Worker %d finished for file %s", workerID, fileMeta.Name)

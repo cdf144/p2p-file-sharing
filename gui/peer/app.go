@@ -218,7 +218,7 @@ func (a *App) DownloadFileWithDialog(fileChecksum, fileName string) (string, err
 		fileMeta.Name, fileMeta.Checksum, saveDir,
 	)
 
-	err = a.corePeer.DownloadFileFromPeer(a.ctx, fileMeta, saveDir)
+	err = a.corePeer.DownloadFile(a.ctx, fileMeta, saveDir)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file %s: %v", fileMeta.Name, err)
 		return "", fmt.Errorf("failed to download file %s: %w", fileMeta.Name, err)
