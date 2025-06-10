@@ -411,9 +411,6 @@ func (p *CorePeer) downloadChunkWorker(
 	copy(candidatePeers, peerAddresses)
 	rSeed := time.Now().UnixNano() + int64(workerID)
 	r := rand.New(rand.NewSource(rSeed))
-	r.Shuffle(len(candidatePeers), func(i, j int) {
-		candidatePeers[i], candidatePeers[j] = candidatePeers[j], candidatePeers[i]
-	})
 
 	for chunkIndex := range jobs {
 		select {
@@ -428,6 +425,10 @@ func (p *CorePeer) downloadChunkWorker(
 		}
 
 		p.logger.Printf("Worker %d: attempting to download chunk %d for %s", workerID, chunkIndex, fileMeta.Name)
+
+		r.Shuffle(len(candidatePeers), func(i, j int) {
+			candidatePeers[i], candidatePeers[j] = candidatePeers[j], candidatePeers[i]
+		})
 
 		var downloadedData []byte
 		var downloadErr error
