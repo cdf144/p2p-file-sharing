@@ -220,6 +220,12 @@ func (c *ConnectionHandler) handleChunkRequestCommand(conn net.Conn, reader *buf
 		"Successfully sent chunk %d (%d bytes) for file %s (%s) to %s",
 		chunkIndex, n, fileMeta.Name, fileChecksum, conn.RemoteAddr(),
 	)
+
+	if remoteTCPAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		if remoteNetIPAddr, err := netip.ParseAddrPort(remoteTCPAddr.String()); err == nil {
+			c.peerRegistry.RecordPeerActivity(remoteNetIPAddr)
+		}
+	}
 }
 
 // handleFileRequestCommand processes a FILE_REQUEST message.

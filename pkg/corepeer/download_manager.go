@@ -235,6 +235,7 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 				}
 
 				dm.logger.Printf("Pass %d: Successfully processed chunk %d for %s.", downloadPasses, res.index, fileMeta.Name)
+				dm.peerRegistry.RecordPeerActivity(res.peer)
 				delete(chunksPending, res.index)
 				delete(chunkFailureCounts, res.index)
 			}
@@ -550,6 +551,7 @@ func (dm *DownloadManager) runPeerDownloadSession(
 			downloadedData = []byte{}
 		}
 
+		dm.peerRegistry.RecordPeerActivity(peerAddr)
 		results <- chunkDownloadResult{index: chunkIndex, data: downloadedData, peer: peerAddr, err: nil}
 	}
 }

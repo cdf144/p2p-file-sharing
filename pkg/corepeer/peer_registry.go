@@ -163,6 +163,17 @@ func (pr *PeerRegistry) UpdatePeerStatus(addr netip.AddrPort, status PeerStatus)
 	pr.logger.Printf("Peer %s status changed: %v -> %v", addr, oldStatus, status)
 }
 
+// RecordPeerActivity updates the LastSeen timestamp for a peer, indicating recent interaction.
+// This helps prevent active peers from being prematurely marked as stale.
+func (pr *PeerRegistry) RecordPeerActivity(addr netip.AddrPort) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	if peer, ok := pr.peers[addr]; ok {
+		peer.LastSeen = time.Now()
+	}
+}
+
 func (pr *PeerRegistry) GetPeers() map[netip.AddrPort]*PeerRegistryInfo {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
