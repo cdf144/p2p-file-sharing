@@ -12,10 +12,14 @@ export function FetchNetworkFiles():Promise<Array<protocol.FileMeta>>;
 
 export function FetchPeersForFile(arg1:string):Promise<Array<netip.AddrPort>>;
 
+export function GetCurrentConfig():Promise<corepeer.CorePeerConfig>;
+
+export function GetCurrentSharedFiles():Promise<Array<protocol.FileMeta>>;
+
 export function SelectShareDirectory():Promise<string>;
 
-export function StartPeerLogic(arg1:string,arg2:string,arg3:number,arg4:number):Promise<corepeer.CorePeerConfig>;
+export function StartPeerLogic(arg1:string,arg2:string,arg3:number,arg4:number):Promise<void>;
 
 export function StopPeerLogic():Promise<void>;
 
-export function UpdatePeerConfig(arg1:string,arg2:string,arg3:number,arg4:number):Promise<corepeer.CorePeerConfig>;
+export function UpdatePeerConfig(arg1:string,arg2:string,arg3:number,arg4:number):Promise<void>;

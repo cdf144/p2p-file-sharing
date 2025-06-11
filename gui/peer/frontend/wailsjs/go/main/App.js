@@ -18,6 +18,14 @@ export function FetchPeersForFile(arg1) {
   return window['go']['main']['App']['FetchPeersForFile'](arg1);
 }
 
+export function GetCurrentConfig() {
+  return window['go']['main']['App']['GetCurrentConfig']();
+}
+
+export function GetCurrentSharedFiles() {
+  return window['go']['main']['App']['GetCurrentSharedFiles']();
+}
+
 export function SelectShareDirectory() {
   return window['go']['main']['App']['SelectShareDirectory']();
 }

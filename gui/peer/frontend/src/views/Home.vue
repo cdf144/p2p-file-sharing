@@ -4,6 +4,8 @@ import {
     DownloadFileWithDialog,
     FetchNetworkFiles,
     FetchPeersForFile,
+    GetCurrentConfig,
+    GetCurrentSharedFiles,
     SelectShareDirectory,
     StartPeerLogic,
     StopPeerLogic,
@@ -84,16 +86,12 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
         peerConfig.servePort = configFromChild.servePort;
         peerConfig.publicPort = configFromChild.publicPort;
 
-        const updatedConfig = await StartPeerLogic(
+        await StartPeerLogic(
             peerConfig.indexURL,
             peerConfig.shareDir,
             Number(peerConfig.servePort),
             Number(peerConfig.publicPort),
         );
-        peerConfig.indexURL = updatedConfig.IndexURL;
-        peerConfig.shareDir = updatedConfig.ShareDir;
-        peerConfig.servePort = updatedConfig.ServePort;
-        peerConfig.publicPort = updatedConfig.PublicPort;
 
         peerState.statusMessage = 'Peer started successfully.';
         peerState.isServing = true;
@@ -107,16 +105,14 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
 }
 
 function updatePeerConfig(newConfig: typeof peerConfig) {
-    UpdatePeerConfig(newConfig.indexURL, newConfig.shareDir, Number(newConfig.servePort), Number(newConfig.publicPort))
-        .then((updatedConfig: corepeer.CorePeerConfig) => {
-            peerConfig.indexURL = updatedConfig.IndexURL;
-            peerConfig.shareDir = updatedConfig.ShareDir;
-            peerConfig.servePort = updatedConfig.ServePort;
-            peerConfig.publicPort = updatedConfig.PublicPort;
-        })
-        .catch((error: any) => {
-            LogError(`Error updating peer config: ${error}`);
-        });
+    UpdatePeerConfig(
+        newConfig.indexURL,
+        newConfig.shareDir,
+        Number(newConfig.servePort),
+        Number(newConfig.publicPort),
+    ).catch((error: any) => {
+        LogError(`Error updating peer config: ${error}`);
+    });
 }
 
 async function queryNetwork() {
@@ -158,14 +154,39 @@ async function downloadFile(file: protocol.FileMeta) {
 }
 
 let unsubscribeFilesScanned: (() => void) | undefined;
-onMounted(() => {
+let unsubscribePeerConfigUpdated: (() => void) | undefined;
+
+onMounted(async () => {
+    try {
+        const initialConfig = await GetCurrentConfig();
+        peerConfig.indexURL = initialConfig.IndexURL;
+        peerConfig.shareDir = initialConfig.ShareDir;
+        peerConfig.servePort = initialConfig.ServePort;
+        peerConfig.publicPort = initialConfig.PublicPort;
+
+        const initialFiles = await GetCurrentSharedFiles();
+        peerState.sharedFiles = initialFiles || [];
+    } catch (error: any) {
+        LogError(`Error fetching initial state: ${error}`);
+    }
+
     unsubscribeFilesScanned = EventsOn('filesScanned', (files: protocol.FileMeta[] | null) => {
         peerState.sharedFiles = files || [];
     });
+    unsubscribePeerConfigUpdated = EventsOn('peerConfigUpdated', (config: corepeer.CorePeerConfig) => {
+        peerConfig.indexURL = config.IndexURL;
+        peerConfig.shareDir = config.ShareDir;
+        peerConfig.servePort = config.ServePort;
+        peerConfig.publicPort = config.PublicPort;
+    });
 });
+
 onUnmounted(() => {
     if (unsubscribeFilesScanned) {
         unsubscribeFilesScanned();
+    }
+    if (unsubscribePeerConfigUpdated) {
+        unsubscribePeerConfigUpdated();
     }
 });
 </script>
