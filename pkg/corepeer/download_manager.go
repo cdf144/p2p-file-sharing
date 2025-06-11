@@ -21,25 +21,50 @@ import (
 )
 
 const (
-	maxConcurrentDownloadsPerFile = 6
-	maxRetriesPerChunk            = 2
-	chunkDownloadTimeout          = 30 * time.Second
-	peerConnectTimeout            = 10 * time.Second
+	MAX_CONCURRENT_DOWNLOADS_PER_FILE = 6
+	MAX_RETRIES_PER_CHUNK             = 2
+	CHUNK_DOWNLOAD_TIMEOUT            = 30 * time.Second
+	PEER_CONNECTION_TIMEOUT           = 10 * time.Second
 )
 
 type DownloadManager struct {
-	logger      *log.Logger
-	indexClient *IndexClient
+	logger       *log.Logger
+	indexClient  *IndexClient
+	peerRegistry *PeerRegistry
 }
 
-func NewDownloadManager(logger *log.Logger, indexClient *IndexClient) *DownloadManager {
+func NewDownloadManager(logger *log.Logger, indexClient *IndexClient, peerRegistry *PeerRegistry) *DownloadManager {
 	return &DownloadManager{
-		logger:      logger,
-		indexClient: indexClient,
+		logger:       logger,
+		indexClient:  indexClient,
+		peerRegistry: peerRegistry,
 	}
 }
 
 func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
+	var peers []netip.AddrPort
+
+	registryPeers := dm.peerRegistry.GetPeersWithFile(fileMeta.Checksum)
+	if len(registryPeers) > 0 {
+		dm.logger.Printf("Found %d peers in registry for file %s", len(registryPeers), fileMeta.Name)
+		peers = registryPeers
+	}
+
+	if len(peers) == 0 {
+		dm.logger.Printf("No peers for file %s in registry, querying index server.", fileMeta.Name)
+		indexQueriedPeers, err := dm.indexClient.QueryFilePeers(ctx, fileMeta.Checksum)
+		if err != nil {
+			return fmt.Errorf("failed to query peers from index for file %s: %w", fileMeta.Checksum, err)
+		}
+		if len(indexQueriedPeers) == 0 {
+			return fmt.Errorf("no peers found for file %s (checksum: %s) from index or registry", fileMeta.Name, fileMeta.Checksum)
+		}
+		peers = indexQueriedPeers
+		for _, addr := range peers {
+			dm.peerRegistry.AddPeer(addr, []protocol.FileMeta{fileMeta})
+		}
+	}
+
 	if fileMeta.NumChunks == 0 && fileMeta.Size > 0 {
 		return fmt.Errorf("file metadata indicates non-empty file but zero chunks for %s", fileMeta.Name)
 	}
@@ -66,17 +91,9 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 		)
 	}
 
-	peerAddresses, err := dm.indexClient.QueryFilePeers(ctx, fileMeta.Checksum)
-	if err != nil {
-		return fmt.Errorf("failed to query peers for file %s: %w", fileMeta.Checksum, err)
-	}
-	if len(peerAddresses) == 0 {
-		return fmt.Errorf("no peers found for file %s (checksum: %s)", fileMeta.Name, fileMeta.Checksum)
-	}
-
 	dm.logger.Printf(
 		"Starting parallel download of %s (%s, %d chunks) from %d available peers to %s",
-		fileMeta.Name, fileMeta.Checksum, fileMeta.NumChunks, len(peerAddresses), savePath,
+		fileMeta.Name, fileMeta.Checksum, fileMeta.NumChunks, len(peers), savePath,
 	)
 
 	file, err := os.Create(savePath)
@@ -104,7 +121,7 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 	chunkFailureCounts := make(map[int]int)
 
 	downloadPasses := 0
-	maxDownloadPasses := len(peerAddresses) + 2 // Extra passes for retries (arbitrary number, can be tuned)
+	maxDownloadPasses := len(peers) + 2 // Extra passes for retries (arbitrary number, can be tuned)
 
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -118,10 +135,10 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 
 		chunkJobQueue := make(chan int, len(chunksPending))
 		for chunkIdx := range chunksPending {
-			if chunkFailureCounts[chunkIdx] < maxRetriesPerChunk {
+			if chunkFailureCounts[chunkIdx] < MAX_RETRIES_PER_CHUNK {
 				chunkJobQueue <- chunkIdx
 			} else {
-				dm.logger.Printf("Chunk %d for %s has reached max retries (%d), skipping.", chunkIdx, fileMeta.Name, maxRetriesPerChunk)
+				dm.logger.Printf("Chunk %d for %s has reached max retries (%d), skipping.", chunkIdx, fileMeta.Name, MAX_RETRIES_PER_CHUNK)
 				delete(chunksPending, chunkIdx)
 			}
 		}
@@ -137,11 +154,11 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 		resultsChan := make(chan chunkDownloadResult, fileMeta.NumChunks)
 		var workersWg sync.WaitGroup
 
-		shuffledPeers := make([]netip.AddrPort, len(peerAddresses))
-		copy(shuffledPeers, peerAddresses)
+		shuffledPeers := make([]netip.AddrPort, len(peers))
+		copy(shuffledPeers, peers)
 		rand.Shuffle(len(shuffledPeers), func(i, j int) { shuffledPeers[i], shuffledPeers[j] = shuffledPeers[j], shuffledPeers[i] })
 
-		numWorkers := min(len(shuffledPeers), maxConcurrentDownloadsPerFile, len(chunksPending))
+		numWorkers := min(len(shuffledPeers), MAX_CONCURRENT_DOWNLOADS_PER_FILE, len(chunksPending))
 		if numWorkers == 0 && len(chunksPending) > 0 {
 			numWorkers = 1
 		}
@@ -180,10 +197,10 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 						downloadPasses, res.index, res.peer, res.err,
 					)
 					chunkFailureCounts[res.index]++
-					if chunkFailureCounts[res.index] >= maxRetriesPerChunk {
+					if chunkFailureCounts[res.index] >= MAX_RETRIES_PER_CHUNK {
 						dm.logger.Printf(
 							"Chunk %d for %s has now reached max retries (%d) after failure in pass %d.",
-							res.index, fileMeta.Name, maxRetriesPerChunk, downloadPasses,
+							res.index, fileMeta.Name, MAX_RETRIES_PER_CHUNK, downloadPasses,
 						)
 						delete(chunksPending, res.index)
 					}
@@ -198,8 +215,8 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 					dm.logger.Printf("Pass %d: Chunk %d checksum mismatch (expected %s, got %s). Will retry.",
 						downloadPasses, res.index, fileMeta.ChunkHashes[res.index], actualChunkChecksum)
 					chunkFailureCounts[res.index]++
-					if chunkFailureCounts[res.index] >= maxRetriesPerChunk {
-						dm.logger.Printf("Chunk %d for %s (checksum mismatch) has now reached max retries (%d).", res.index, fileMeta.Name, maxRetriesPerChunk)
+					if chunkFailureCounts[res.index] >= MAX_RETRIES_PER_CHUNK {
+						dm.logger.Printf("Chunk %d for %s (checksum mismatch) has now reached max retries (%d).", res.index, fileMeta.Name, MAX_RETRIES_PER_CHUNK)
 						delete(chunksPending, res.index)
 					}
 					continue
@@ -211,7 +228,7 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 				if writeErr != nil {
 					dm.logger.Printf("Pass %d: Failed to write chunk %d to file %s: %v. Marking for retry.", downloadPasses, res.index, savePath, writeErr)
 					chunkFailureCounts[res.index]++
-					if chunkFailureCounts[res.index] >= maxRetriesPerChunk {
+					if chunkFailureCounts[res.index] >= MAX_RETRIES_PER_CHUNK {
 						delete(chunksPending, res.index)
 					}
 					continue
@@ -235,7 +252,7 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 			if _, isPending := chunksPending[res.index]; isPending {
 				if res.err != nil {
 					chunkFailureCounts[res.index]++
-					if chunkFailureCounts[res.index] >= maxRetriesPerChunk {
+					if chunkFailureCounts[res.index] >= MAX_RETRIES_PER_CHUNK {
 						delete(chunksPending, res.index)
 					}
 				}
@@ -296,15 +313,23 @@ func (dm *DownloadManager) runPeerDownloadSession(
 	defer wg.Done()
 	dm.logger.Printf("Worker session starting with peer %s for file %s", peerAddr, fileMeta.Name)
 
-	conn, err := net.DialTimeout("tcp", peerAddr.String(), peerConnectTimeout)
+	dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusConnecting)
+
+	conn, err := net.DialTimeout("tcp", peerAddr.String(), PEER_CONNECTION_TIMEOUT)
 	if err != nil {
 		dm.logger.Printf(
 			"Worker for %s: failed to connect to peer %s: %v. This worker will not process jobs.",
 			fileMeta.Name, peerAddr, err,
 		)
+		dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusUnreachable)
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusDisconnected)
+	}()
+
+	dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusConnected)
 	dm.logger.Printf("Worker for %s: successfully connected to peer %s", fileMeta.Name, peerAddr)
 
 	writer := bufio.NewWriter(conn)
@@ -326,7 +351,7 @@ func (dm *DownloadManager) runPeerDownloadSession(
 		}
 
 		dm.logger.Printf("Worker for %s: peer %s attempting to download chunk %d", fileMeta.Name, peerAddr, chunkIndex)
-		conn.SetDeadline(time.Now().Add(chunkDownloadTimeout))
+		conn.SetDeadline(time.Now().Add(CHUNK_DOWNLOAD_TIMEOUT))
 
 		var downloadedData []byte
 		var chunkErr error

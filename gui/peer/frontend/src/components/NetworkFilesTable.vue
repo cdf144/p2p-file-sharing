@@ -6,7 +6,7 @@ import { formatFileSize } from '../utils/formatFileSize';
 const MAX_VISIBLE_PAGE_BUTTONS = 5;
 
 const props = defineProps<{
-    allNetworkFiles: protocol.FileMeta[];
+    networkFiles: protocol.FileMeta[];
 }>();
 
 const emit = defineEmits(['download-file']);
@@ -15,13 +15,13 @@ const filesPerPage = ref(10);
 const currentPage = ref(1);
 
 const totalPages = computed(() => {
-    return Math.ceil(props.allNetworkFiles.length / filesPerPage.value);
+    return Math.ceil(props.networkFiles.length / filesPerPage.value);
 });
 
 const paginatedFiles = computed(() => {
     const start = (currentPage.value - 1) * filesPerPage.value;
     const end = currentPage.value * filesPerPage.value;
-    return props.allNetworkFiles.slice(start, end);
+    return props.networkFiles.slice(start, end);
 });
 
 const visiblePages = computed(() => {
@@ -78,7 +78,7 @@ function handleDownloadFile(file: protocol.FileMeta) {
 
 // Reset to page 1 if the total number of files changes (e.g., new network query) or if filesPerPage changes
 watch(
-    () => props.allNetworkFiles.length,
+    () => props.networkFiles.length,
     () => {
         if (currentPage.value > totalPages.value) {
             currentPage.value = Math.max(1, totalPages.value);
@@ -91,7 +91,7 @@ watch(filesPerPage, () => {
 </script>
 
 <template>
-    <div class="rounded-lg bg-gray-700 p-4 shadow" v-if="props.allNetworkFiles.length > 0">
+    <div class="rounded-lg bg-gray-700 p-4 shadow" v-if="props.networkFiles.length > 0">
         <!-- Header with Files Per Page Selector -->
         <div class="mb-4 flex items-center justify-between">
             <h3 class="text-lg font-semibold">Available Files from Network</h3>
@@ -148,11 +148,6 @@ watch(filesPerPage, () => {
                         <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
                             {{ formatFileSize(file.size) }}
                         </td>
-                        <!-- REMOVE PEER IP:PORT CELL
-                        <td class="px-6 py-4 text-left text-sm whitespace-nowrap text-gray-300">
-                            {{ peer.IP.toString() }}:{{ peer.Port }}
-                        </td>
-                        -->
                         <td class="truncate px-6 py-4 text-left text-sm text-gray-300" :title="file.checksum">
                             {{ file.checksum.substring(0, 16) }}...
                         </td>
@@ -173,8 +168,8 @@ watch(filesPerPage, () => {
         <div class="mt-4 flex items-center justify-between" v-if="totalPages > 1">
             <div class="text-sm text-gray-300">
                 Showing {{ (currentPage - 1) * filesPerPage + 1 }} to
-                {{ Math.min(currentPage * filesPerPage, props.allNetworkFiles.length) }}
-                of {{ props.allNetworkFiles.length }} files
+                {{ Math.min(currentPage * filesPerPage, props.networkFiles.length) }}
+                of {{ props.networkFiles.length }} files
             </div>
 
             <div class="flex items-center space-x-2">

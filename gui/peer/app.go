@@ -15,12 +15,6 @@ type App struct {
 	corePeer *corepeer.CorePeer
 }
 
-type FileInfo struct {
-	Checksum string
-	Path     string
-	Name     string
-}
-
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{}
@@ -42,8 +36,8 @@ func (a *App) startup(ctx context.Context) {
 // shutdown is called when the app terminates.
 func (a *App) shutdown(ctx context.Context) {
 	wruntime.LogInfo(ctx, "[peer] Application shutting down...")
-	if a.corePeer != nil && a.corePeer.IsServing() {
-		a.corePeer.Stop()
+	if a.corePeer != nil {
+		a.corePeer.Shutdown()
 		wruntime.LogInfo(ctx, "[peer] CorePeer stopped gracefully.")
 	}
 }
@@ -252,4 +246,20 @@ func (a *App) DownloadFileWithDialog(fileChecksum, fileName string) (string, err
 	successMsg := fmt.Sprintf("Successfully downloaded %s to %s", fileMeta.Name, saveDir)
 	wruntime.LogInfo(a.ctx, "[peer] "+successMsg)
 	return successMsg, nil
+}
+
+func (a *App) GetConnectedPeers() ([]corepeer.PeerRegistryInfo, error) {
+	if a.corePeer == nil {
+		return nil, fmt.Errorf("CorePeer not initialized")
+	}
+
+	allPeersMap := a.corePeer.GetConnectedPeers()
+	var result []corepeer.PeerRegistryInfo
+	for _, peerInfoPtr := range allPeersMap {
+		if peerInfoPtr != nil {
+			result = append(result, *peerInfoPtr)
+		}
+	}
+
+	return result, nil
 }

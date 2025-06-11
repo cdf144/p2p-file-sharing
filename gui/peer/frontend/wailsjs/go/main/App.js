@@ -18,6 +18,10 @@ export function FetchPeersForFile(arg1) {
   return window['go']['main']['App']['FetchPeersForFile'](arg1);
 }
 
+export function GetConnectedPeers() {
+  return window['go']['main']['App']['GetConnectedPeers']();
+}
+
 export function GetCurrentConfig() {
   return window['go']['main']['App']['GetCurrentConfig']();
 }

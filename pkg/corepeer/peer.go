@@ -32,6 +32,7 @@ type CorePeer struct {
 	mu                sync.RWMutex
 	logger            *log.Logger
 	fileManager       *FileManager
+	peerRegistry      *PeerRegistry
 	indexClient       *IndexClient
 	downloadManager   *DownloadManager
 	connectionHandler *ConnectionHandler
@@ -50,11 +51,14 @@ type chunkDownloadResult struct {
 func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 	logger := log.New(log.Writer(), "[corepeer] ", log.LstdFlags|log.Lmsgprefix)
 	p := &CorePeer{logger: logger}
+
 	p.fileManager = NewFileManager(logger)
+	p.peerRegistry = NewPeerRegistry(logger)
 	p.indexClient = NewIndexClient(cfg.IndexURL, logger)
-	p.downloadManager = NewDownloadManager(logger, p.indexClient)
-	p.connectionHandler = NewConnectionHandler(logger, p.fileManager)
+	p.downloadManager = NewDownloadManager(logger, p.indexClient, p.peerRegistry)
+	p.connectionHandler = NewConnectionHandler(logger, p.fileManager, p.peerRegistry)
 	p.tcpServer = NewTCPServer(logger, p.connectionHandler, p.fileManager)
+
 	p.UpdateConfig(context.Background(), cfg)
 	return p
 }
@@ -105,6 +109,10 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to announce to index server: %w", err)
 	}
 
+	if err := p.populatePeerRegistryFromIndex(ctx); err != nil {
+		p.logger.Printf("Warning: Failed to populate peer registry from index: %v", err)
+	}
+
 	p.isServing = true
 	statusMsg := fmt.Sprintf(
 		"Peer started. Sharing from: %s. IP: %s, Serving Port: %d, Announced Port: %d. Files shared: %d",
@@ -126,12 +134,40 @@ func (p *CorePeer) Stop() {
 
 	if err := p.indexClient.Deannounce(p.announcedAddr); err != nil {
 		p.logger.Printf("Warning: Failed to de-announce from index server: %v", err)
-		return
 	}
 
 	p.tcpServer.Stop()
 	p.isServing = false
 	p.logger.Println("Peer stopped.")
+}
+
+// Shutdown performs a full shutdown of the CorePeer and its components,
+// including the PeerRegistry. This should be called when the CorePeer instance
+// is no longer needed, e.g., on application exit.
+func (p *CorePeer) Shutdown() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.logger.Println("CorePeer shutdown initiated.")
+
+	if p.isServing {
+		if p.announcedAddr.IsValid() {
+			if err := p.indexClient.Deannounce(p.announcedAddr); err != nil {
+				p.logger.Printf("Warning: Failed to de-announce from index server during shutdown: %v", err)
+			}
+		}
+		p.tcpServer.Stop()
+		p.isServing = false
+		p.logger.Println("CorePeer serving components stopped during shutdown.")
+	}
+
+	if p.peerRegistry != nil {
+		p.logger.Println("Shutting down PeerRegistry...")
+		p.peerRegistry.Shutdown()
+		p.logger.Println("PeerRegistry shut down.")
+	}
+
+	p.logger.Println("CorePeer shutdown complete.")
 }
 
 // GetConfig returns a copy of the current configuration of the CorePeer.
@@ -223,6 +259,10 @@ func (p *CorePeer) FetchFileFromIndex(ctx context.Context, fileChecksum string) 
 // It manages sessions with peers and retries failed chunks.
 func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
 	return p.downloadManager.DownloadFile(ctx, fileMeta, savePath)
+}
+
+func (p *CorePeer) GetConnectedPeers() map[netip.AddrPort]*PeerRegistryInfo {
+	return p.peerRegistry.GetPeers()
 }
 
 // handleIndexURLChange manages the transition from an old index URL to a new one.
@@ -395,4 +435,37 @@ func (p *CorePeer) processServerPortConfig(port int) (int, error) {
 	}
 
 	return port, nil
+}
+
+func (p *CorePeer) populatePeerRegistryFromIndex(ctx context.Context) error {
+	files, err := p.indexClient.FetchAllFiles(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch files from index: %w", err)
+	}
+
+	peerFiles := make(map[netip.AddrPort][]protocol.FileMeta)
+
+	for _, file := range files {
+		peers, err := p.indexClient.QueryFilePeers(ctx, file.Checksum)
+		if err != nil {
+			continue
+		}
+
+		for _, peerAddr := range peers {
+			if peerAddr != p.announcedAddr {
+				peerFiles[peerAddr] = append(peerFiles[peerAddr], file)
+			}
+		}
+	}
+
+	existingPeers := p.peerRegistry.GetPeers()
+	for addr, files := range peerFiles {
+		// Don't refresh existing peers since it'll mess up their last seen timestamps.
+		if _, ok := existingPeers[addr]; !ok {
+			p.peerRegistry.AddPeer(addr, files)
+		}
+	}
+
+	p.logger.Printf("Populated peer registry with %d peers from index server", len(peerFiles))
+	return nil
 }

@@ -12,6 +12,8 @@ export function FetchNetworkFiles():Promise<Array<protocol.FileMeta>>;
 
 export function FetchPeersForFile(arg1:string):Promise<Array<netip.AddrPort>>;
 
+export function GetConnectedPeers():Promise<Array<corepeer.PeerRegistryInfo>>;
+
 export function GetCurrentConfig():Promise<corepeer.CorePeerConfig>;
 
 export function GetCurrentSharedFiles():Promise<Array<protocol.FileMeta>>;

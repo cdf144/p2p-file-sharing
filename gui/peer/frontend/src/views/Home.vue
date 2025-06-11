@@ -1,9 +1,10 @@
 <script lang="ts" setup>
-import { computed, onMounted, onUnmounted, reactive } from 'vue';
+import { onMounted, onUnmounted, reactive } from 'vue';
 import {
     DownloadFileWithDialog,
     FetchNetworkFiles,
     FetchPeersForFile,
+    GetConnectedPeers,
     GetCurrentConfig,
     GetCurrentSharedFiles,
     SelectShareDirectory,
@@ -16,8 +17,11 @@ import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
 import NetworkDiscovery from '../components/NetworkDiscovery.vue';
 import NetworkFilesTable from '../components/NetworkFilesTable.vue';
 import PeerConfiguration from '../components/PeerConfiguration.vue';
+import PeerList from '../components/PeerList.vue';
 import PeerStatus from '../components/PeerStatus.vue';
 import SharedFilesTable from '../components/SharedFilesTable.vue';
+
+const PEER_REGISTRY_REFRESH_INTERVAL = 1000; // 1s
 
 const peerConfig = reactive({
     indexURL: 'http://localhost:9090',
@@ -40,7 +44,10 @@ const networkState = reactive({
     lastQueryTime: null as Date | null,
 });
 
-const allNetworkFiles = computed(() => networkState.networkFiles || []);
+const peerListState = reactive({
+    peers: [] as corepeer.PeerRegistryInfo[],
+    isLoading: false,
+});
 
 async function handleSelectDirectory() {
     try {
@@ -70,6 +77,7 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
             await StopPeerLogic();
             peerState.statusMessage = 'Peer stopped successfully.';
             peerState.isServing = false;
+            peerListState.peers = [];
         } catch (error: any) {
             LogError(`Error stopping peer: ${error}`);
             peerState.statusMessage = `Error stopping peer: ${error.message || error}`;
@@ -95,6 +103,8 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
 
         peerState.statusMessage = 'Peer started successfully.';
         peerState.isServing = true;
+
+        await refreshPeerList();
     } catch (error: any) {
         LogError(`Error starting peer: ${error}`);
         peerState.statusMessage = `Error starting peer: ${error.message || error}`;
@@ -122,6 +132,10 @@ async function queryNetwork() {
         const files = await FetchNetworkFiles();
         networkState.networkFiles = files ? files : [];
         networkState.lastQueryTime = new Date();
+
+        if (peerState.isServing) {
+            await refreshPeerList();
+        }
     } catch (error: any) {
         networkState.queryError = `Error querying network: ${error.message || error}`;
         networkState.networkFiles = [];
@@ -133,8 +147,6 @@ async function queryNetwork() {
 async function downloadFile(file: protocol.FileMeta) {
     try {
         peerState.statusMessage = `Fetching peers for ${file.name}...`;
-        // Fetch peers that have this file using its checksum
-        // The indexURL is implicitly used by the backend's corePeer configuration
         const peers = await FetchPeersForFile(file.checksum);
 
         if (!peers || peers.length === 0) {
@@ -144,12 +156,42 @@ async function downloadFile(file: protocol.FileMeta) {
             return;
         }
 
+        await refreshPeerList();
         peerState.statusMessage = `Downloading ${file.name} from peer...`;
         const result = await DownloadFileWithDialog(file.checksum, file.name);
         peerState.statusMessage = result;
     } catch (error: any) {
         LogError(`Error in download process for ${file.name}: ${error}`);
         peerState.statusMessage = `Error downloading file: ${error.message || error}`;
+    }
+}
+
+let refreshPeerTimeoutId: NodeJS.Timeout | null = null;
+let stopRefreshPeerLoop = false;
+
+async function refreshPeerList() {
+    if (peerListState.isLoading) {
+        return;
+    }
+    peerListState.isLoading = true;
+    try {
+        const peers = await GetConnectedPeers();
+        peerListState.peers = peers || [];
+    } catch (error: any) {
+        LogError(`Error fetching peer list: ${error}`);
+        peerListState.peers = [];
+    } finally {
+        peerListState.isLoading = false;
+    }
+}
+
+async function refreshPeerListLoop() {
+    if (stopRefreshPeerLoop) {
+        return;
+    }
+    await refreshPeerList();
+    if (!stopRefreshPeerLoop) {
+        refreshPeerTimeoutId = setTimeout(refreshPeerListLoop, PEER_REGISTRY_REFRESH_INTERVAL);
     }
 }
 
@@ -166,9 +208,14 @@ onMounted(async () => {
 
         const initialFiles = await GetCurrentSharedFiles();
         peerState.sharedFiles = initialFiles || [];
+
+        await refreshPeerList();
     } catch (error: any) {
         LogError(`Error fetching initial state: ${error}`);
     }
+
+    stopRefreshPeerLoop = false;
+    refreshPeerListLoop();
 
     unsubscribeFilesScanned = EventsOn('filesScanned', (files: protocol.FileMeta[] | null) => {
         peerState.sharedFiles = files || [];
@@ -187,6 +234,10 @@ onUnmounted(() => {
     }
     if (unsubscribePeerConfigUpdated) {
         unsubscribePeerConfigUpdated();
+    }
+    stopRefreshPeerLoop = true;
+    if (refreshPeerTimeoutId) {
+        clearTimeout(refreshPeerTimeoutId);
     }
 });
 </script>
@@ -207,16 +258,17 @@ onUnmounted(() => {
         :share-dir="peerConfig.shareDir"
     />
 
+    <PeerList :peers="peerListState.peers" :is-loading="peerListState.isLoading" @refresh-peers="refreshPeerList" />
+
     <NetworkDiscovery
         :is-querying="networkState.isQuerying"
         :query-error="networkState.queryError"
         :last-query-time="networkState.lastQueryTime"
         :network-files="networkState.networkFiles"
-        :all-network-files-count="allNetworkFiles.length"
         @discover-peers="queryNetwork"
     />
 
-    <NetworkFilesTable :all-network-files="allNetworkFiles" @download-file="downloadFile" />
+    <NetworkFilesTable :network-files="networkState.networkFiles" @download-file="downloadFile" />
 
     <SharedFilesTable :shared-files="peerState.sharedFiles" :share-dir="peerConfig.shareDir" />
 </template>

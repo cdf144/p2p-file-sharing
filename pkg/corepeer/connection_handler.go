@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -15,31 +16,41 @@ import (
 )
 
 const (
-	persistentConnectionIdleTimeout = 2 * time.Minute
-	activeRequestProcessingTimeout  = 90 * time.Second
+	PERSISTENT_CONNECTION_IDLE_TIMEOUT = 2 * time.Minute
+	ACTIVE_REQUEST_PROCESSING_TIMEOUT  = 90 * time.Second
 )
 
 type ConnectionHandler struct {
-	logger      *log.Logger
-	fileManager *FileManager
+	logger       *log.Logger
+	fileManager  *FileManager
+	peerRegistry *PeerRegistry
 }
 
-func NewConnectionHandler(logger *log.Logger, fileManager *FileManager) *ConnectionHandler {
+func NewConnectionHandler(logger *log.Logger, fileManager *FileManager, peerRegistry *PeerRegistry) *ConnectionHandler {
 	return &ConnectionHandler{
-		logger:      logger,
-		fileManager: fileManager,
+		logger:       logger,
+		fileManager:  fileManager,
+		peerRegistry: peerRegistry,
 	}
 }
 
 func (c *ConnectionHandler) HandleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		if addr, err := netip.ParseAddrPort(tcpAddr.String()); err == nil {
+			c.peerRegistry.UpdatePeerStatus(addr, PeerStatusConnected)
+			defer c.peerRegistry.UpdatePeerStatus(addr, PeerStatusDisconnected)
+		}
+	}
+
 	c.logger.Printf("Handling new persistent connection from %s", conn.RemoteAddr().String())
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
 	for {
-		if err := conn.SetReadDeadline(time.Now().Add(persistentConnectionIdleTimeout)); err != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(PERSISTENT_CONNECTION_IDLE_TIMEOUT)); err != nil {
 			c.logger.Printf("Error setting read deadline for %s: %v. Closing session.", conn.RemoteAddr(), err)
 			return
 		}
@@ -51,7 +62,7 @@ func (c *ConnectionHandler) HandleConnection(conn net.Conn) {
 			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				c.logger.Printf(
 					"Connection from %s timed out waiting for message type (idle_timeout: %s). Ending session.",
-					conn.RemoteAddr(), persistentConnectionIdleTimeout,
+					conn.RemoteAddr(), PERSISTENT_CONNECTION_IDLE_TIMEOUT,
 				)
 			} else {
 				c.logger.Printf("Failed to read message type from %s: %v. Ending session.", conn.RemoteAddr(), err)
@@ -59,7 +70,7 @@ func (c *ConnectionHandler) HandleConnection(conn net.Conn) {
 			return
 		}
 
-		if err := conn.SetReadDeadline(time.Now().Add(activeRequestProcessingTimeout)); err != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(ACTIVE_REQUEST_PROCESSING_TIMEOUT)); err != nil {
 			c.logger.Printf("Error setting active request read deadline for %s: %v. Closing session.", conn.RemoteAddr(), err)
 			return
 		}

@@ -7,7 +7,6 @@ const props = defineProps<{
     queryError: string;
     lastQueryTime: Date | null;
     networkFiles: protocol.FileMeta[];
-    allNetworkFilesCount: number;
 }>();
 
 const emit = defineEmits(['discover-peers']);
@@ -29,7 +28,7 @@ function discoverPeers() {
                 :disabled="isQuerying"
             >
                 <span v-if="isQuerying">Discovering...</span>
-                <span v-else>Discover Peers</span>
+                <span v-else>Discover Files</span>
             </button>
         </div>
 
@@ -40,7 +39,7 @@ function discoverPeers() {
         <div v-if="lastQueryTime" class="text-sm text-gray-400">Last updated: {{ lastQueryTime.toLocaleString() }}</div>
 
         <div v-if="networkFilesCount > 0" class="text-sm text-gray-300">
-            Found {{ networkFilesCount }} peer(s) sharing {{ allNetworkFilesCount }} file(s)
+            Found <strong>{{ networkFilesCount }}</strong> files.
         </div>
         <div v-else-if="lastQueryTime" class="text-sm text-gray-300">No peers found on the index server.</div>
     </div>
