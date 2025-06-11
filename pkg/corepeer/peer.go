@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -38,10 +37,7 @@ type CorePeerConfig struct {
 type CorePeer struct {
 	config            CorePeerConfig
 	rootCtx           context.Context // Root context for the peer's lifetime, from Start()
-	listener          net.Listener
 	isServing         bool
-	serveCtx          context.Context    // Own context for managing internal serving lifecycle
-	serveCancel       context.CancelFunc // Function to cancel serveCtx
 	announcedAddr     netip.AddrPort
 	mu                sync.RWMutex
 	logger            *log.Logger
@@ -49,6 +45,7 @@ type CorePeer struct {
 	indexClient       *IndexClient
 	downloadManager   *DownloadManager
 	connectionHandler *ConnectionHandler
+	tcpServer         *TCPServer
 }
 
 // chunkDownloadResult represents the result of a goroutine worker downloading a single chunk of data.
@@ -67,6 +64,7 @@ func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 	p.indexClient = NewIndexClient(cfg.IndexURL, logger)
 	p.downloadManager = NewDownloadManager(logger, p.indexClient)
 	p.connectionHandler = NewConnectionHandler(logger, p.fileManager)
+	p.tcpServer = NewTCPServer(logger, p.connectionHandler, p.fileManager)
 	p.UpdateConfig(context.Background(), cfg)
 	return p
 }
@@ -99,7 +97,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	}
 	p.logger.Printf("Using serve port: %d", p.config.ServePort)
 	if p.config.ShareDir != "" {
-		p.startTCPServer(p.rootCtx)
+		p.tcpServer.Start(ctx, p.config.ServePort)
 	}
 
 	// 3. Announce to index server
@@ -113,13 +111,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 
 	p.announcedAddr = netip.AddrPortFrom(announceIP, announcePort)
 	if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
-		if p.listener != nil {
-			p.listener.Close()
-			p.listener = nil
-		}
-		if p.serveCancel != nil {
-			p.serveCancel()
-		}
+		p.tcpServer.Stop()
 		return "", fmt.Errorf("failed to announce to index server: %w", err)
 	}
 
@@ -147,7 +139,7 @@ func (p *CorePeer) Stop() {
 		return
 	}
 
-	p.stopTCPServer()
+	p.tcpServer.Stop()
 	p.isServing = false
 	p.logger.Println("Peer stopped.")
 }
@@ -169,9 +161,9 @@ func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) (
 	defer p.mu.Unlock()
 
 	// Defensive check: if not serving but listener exists, ensure it's stopped.
-	if !p.isServing && p.listener != nil {
+	if !p.isServing && p.tcpServer.IsRunning() {
 		p.logger.Println("Warning: Peer is not serving, but listener exists. Stopping listener.")
-		p.stopTCPServer()
+		p.tcpServer.Stop()
 	}
 
 	if p.isServing {
@@ -243,39 +235,6 @@ func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta,
 	return p.downloadManager.DownloadFile(ctx, fileMeta, savePath)
 }
 
-// acceptConnections starts the TCP file server and handles incoming connections.
-func (p *CorePeer) acceptConnections(ctx context.Context) {
-	if p.listener == nil {
-		p.logger.Println("Error: acceptConnections called with a nil listener.")
-		return
-	}
-	p.logger.Printf("Accepting connections on %s", p.listener.Addr().String())
-
-	for {
-		conn, err := p.listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				p.logger.Println("Context cancelled, server accept loop stopping gracefully.")
-				return
-			default:
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					p.logger.Println("Listener closed, server accept loop stopping.")
-				} else {
-					p.logger.Printf("Error accepting connection: %v. Server accept loop stopping.", err)
-				}
-				return
-			}
-		}
-		p.logger.Printf("Accepted connection from %s", conn.RemoteAddr().String())
-		go p.handleConnection(conn)
-	}
-}
-
-func (p *CorePeer) handleConnection(conn net.Conn) {
-	p.connectionHandler.HandleConnection(conn)
-}
-
 // handleIndexURLChange manages the transition from an old index URL to a new one.
 // If de-announcement from the old index fails, the configuration is rolled back
 // and an error is returned. The method is safe to call with identical old and
@@ -343,7 +302,7 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 	}
 
 	if p.isServing {
-		if err := p.updateTCPServerState(willNowShareFromDir, wasPreviouslySharingFromDir); err != nil {
+		if err := p.tcpServer.UpdateState(ctx, willNowShareFromDir, wasPreviouslySharingFromDir, p.config.ServePort); err != nil {
 			p.config.ShareDir = oldShareDir
 			return err
 		}
@@ -380,9 +339,9 @@ func (p *CorePeer) handleServePortChange(oldServePort, newServePort int) error {
 	}
 	p.logger.Printf("Serve port changing, restarting TCP server")
 
-	p.stopTCPServer()
+	p.tcpServer.Stop()
 	if p.config.ShareDir != "" {
-		if err := p.startTCPServer(p.rootCtx); err != nil {
+		if err := p.tcpServer.Start(p.rootCtx, p.config.ServePort); err != nil {
 			return fmt.Errorf("failed to restart TCP server on new port %d: %w", newServePort, err)
 		}
 	}
@@ -418,68 +377,6 @@ func (p *CorePeer) handlePublicPortChange(oldPublicPort, newPublicPort int) erro
 	}
 	p.logger.Printf("Re-announced to index server with new public port: %d", newPublicPort)
 
-	return nil
-}
-
-// stopTCPServer gracefully shuts down the TCP server by canceling the serve context
-// and closing the network listener. After shutdown, the listener is set to nil.
-func (p *CorePeer) stopTCPServer() {
-	if p.serveCancel != nil {
-		p.serveCancel()
-	}
-	if p.listener != nil {
-		err := p.listener.Close()
-		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-			p.logger.Printf("Warning: Error closing listener: %v", err)
-		}
-		p.listener = nil
-		p.logger.Println("TCP file server stopped.")
-	}
-}
-
-// startTCPServer initializes and starts a TCP server on the configured port.
-// It creates a TCP listener, stores it in the peer instance, and begins accepting
-// incoming connections in a separate goroutine.
-// The server will continue running until the context is cancelled or an error occurs.
-// If a listener already exists, the method returns early without error.
-func (p *CorePeer) startTCPServer(ctx context.Context) error {
-	if p.listener != nil {
-		p.logger.Println("TCP server already running or listener already exists.")
-		return nil
-	}
-	if ctx == nil || ctx.Err() != nil {
-		return fmt.Errorf("cannot start TCP server, context is not active or nil")
-	}
-
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", p.config.ServePort))
-	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %w", p.config.ServePort, err)
-	}
-	p.logger.Printf("TCP server started on port: %d", p.config.ServePort)
-
-	p.listener = l
-	p.serveCtx, p.serveCancel = context.WithCancel(ctx)
-	go p.acceptConnections(p.serveCtx)
-
-	return nil
-}
-
-// updateTCPServerState manages the TCP server lifecycle based on the desired and current state.
-// It starts the TCP server if it should be running but isn't currently running or if the listener is nil.
-// It stops the TCP server if it shouldn't be running but is currently running.
-// Returns an error if starting the TCP server fails.
-func (p *CorePeer) updateTCPServerState(shouldBeRunning, wasRunning bool) error {
-	if shouldBeRunning && (!wasRunning || p.listener == nil) {
-		p.logger.Printf("Starting TCP server for sharing directory: %s", p.config.ShareDir)
-		if p.rootCtx == nil {
-			p.logger.Println("Error: peerRootCtx is nil, cannot start TCP server. Peer might not have been started correctly.")
-			return fmt.Errorf("peerRootCtx is nil, cannot start TCP server")
-		}
-		return p.startTCPServer(p.rootCtx)
-	} else if !shouldBeRunning && wasRunning {
-		p.logger.Println("Stopping TCP server - no directory to share.")
-		p.stopTCPServer()
-	}
 	return nil
 }
 

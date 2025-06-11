@@ -33,6 +33,12 @@ func (fm *FileManager) GetSharedFiles() []protocol.FileMeta {
 	return filesCopy
 }
 
+func (fm *FileManager) GetShareDir() string {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+	return fm.shareDir
+}
+
 func (fm *FileManager) Reset() {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
