@@ -1,12 +1,13 @@
 <script lang="ts" setup>
 import { computed, ref, watch } from 'vue';
-import { protocol } from '../../wailsjs/go/models';
+import { main, protocol } from '../../wailsjs/go/models';
 import { formatFileSize } from '../utils/formatFileSize';
 
 const MAX_VISIBLE_PAGE_BUTTONS = 5;
 
 const props = defineProps<{
     networkFiles: protocol.FileMeta[];
+    downloadProgress: Record<string, main.DownloadProgressEvent>;
 }>();
 
 const emit = defineEmits(['download-file']);
@@ -74,6 +75,15 @@ function nextPage() {
 
 function handleDownloadFile(file: protocol.FileMeta) {
     emit('download-file', file);
+}
+
+function getFileProgress(checksum: string): main.DownloadProgressEvent | undefined {
+    return props.downloadProgress[checksum];
+}
+
+function getProgressPercentage(progress?: main.DownloadProgressEvent): number {
+    if (!progress || progress.totalChunks === 0) return 0;
+    return Math.round((progress.downloadedChunks / progress.totalChunks) * 100);
 }
 
 // Reset to page 1 if the total number of files changes (e.g., new network query) or if filesPerPage changes
@@ -152,7 +162,41 @@ watch(filesPerPage, () => {
                             {{ file.checksum.substring(0, 16) }}...
                         </td>
                         <td class="px-6 py-4 text-left text-sm whitespace-nowrap">
+                            <div v-if="getFileProgress(file.checksum) && !getFileProgress(file.checksum)?.isComplete">
+                                <div class="text-xs text-gray-400">
+                                    Downloading: {{ getFileProgress(file.checksum)?.downloadedChunks }} /
+                                    {{ getFileProgress(file.checksum)?.totalChunks }} Chunks
+                                </div>
+                                <div class="h-2.5 w-full rounded-full bg-gray-600">
+                                    <div
+                                        class="h-2.5 rounded-full bg-blue-500"
+                                        :style="{ width: getProgressPercentage(getFileProgress(file.checksum)) + '%' }"
+                                    ></div>
+                                </div>
+                                <div v-if="getFileProgress(file.checksum)?.errorMessage" class="text-sm text-red-400">
+                                    Error: {{ getFileProgress(file.checksum)?.errorMessage }}
+                                </div>
+                            </div>
+                            <div
+                                v-else-if="
+                                    getFileProgress(file.checksum)?.isComplete &&
+                                    getFileProgress(file.checksum)?.errorMessage
+                                "
+                                class="text-sm text-red-400"
+                            >
+                                Download Failed
+                            </div>
+                            <div
+                                v-else-if="
+                                    getFileProgress(file.checksum)?.isComplete &&
+                                    !getFileProgress(file.checksum)?.errorMessage
+                                "
+                                class="text-sm text-green-400"
+                            >
+                                Download Complete
+                            </div>
                             <button
+                                v-else
                                 @click="handleDownloadFile(file)"
                                 class="focus:ring-opacity-50 rounded bg-green-600 px-3 py-1 text-sm text-white hover:bg-green-700 focus:ring-2 focus:ring-green-500 focus:outline-none"
                             >

@@ -15,6 +15,15 @@ type App struct {
 	corePeer *corepeer.CorePeer
 }
 
+type DownloadProgressEvent struct {
+	FileChecksum     string `json:"fileChecksum"`
+	FileName         string `json:"fileName"`
+	DownloadedChunks int    `json:"downloadedChunks"`
+	TotalChunks      int    `json:"totalChunks"`
+	IsComplete       bool   `json:"isComplete"`
+	ErrorMessage     string `json:"errorMessage,omitempty"`
+}
+
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{}
@@ -49,6 +58,20 @@ func (a *App) DummyPeerInfo() protocol.PeerInfo {
 	return protocol.PeerInfo{
 		Address: netip.AddrPort{},
 		Files:   []protocol.FileMeta{},
+	}
+}
+
+// DummyDownloadProgress is a dummy method to satisfy the Wails binding requirements, helping
+// Wails generate the main.DownloadProgressEvent type for the frontend.
+// It's not intended to be called by the frontend for any real purpose.
+func (a *App) DummyDownloadProgress() DownloadProgressEvent {
+	return DownloadProgressEvent{
+		FileChecksum:     "",
+		FileName:         "",
+		DownloadedChunks: 0,
+		TotalChunks:      0,
+		IsComplete:       false,
+		ErrorMessage:     "",
 	}
 }
 
@@ -237,7 +260,18 @@ func (a *App) DownloadFileWithDialog(fileChecksum, fileName string) (string, err
 		fileMeta.Name, fileMeta.Checksum, saveDir,
 	)
 
-	err = a.corePeer.DownloadFile(a.ctx, fileMeta, saveDir)
+	progressCallback := func(chksum string, fName string, downloaded int, total int, complete bool, errMsg string) {
+		wruntime.EventsEmit(a.ctx, "downloadProgress", DownloadProgressEvent{
+			FileChecksum:     chksum,
+			FileName:         fName,
+			DownloadedChunks: downloaded,
+			TotalChunks:      total,
+			IsComplete:       complete,
+			ErrorMessage:     errMsg,
+		})
+	}
+
+	err = a.corePeer.DownloadFile(a.ctx, fileMeta, saveDir, progressCallback)
 	if err != nil {
 		wruntime.LogErrorf(a.ctx, "[peer] Failed to download file %s: %v", fileMeta.Name, err)
 		return "", fmt.Errorf("failed to download file %s: %w", fileMeta.Name, err)

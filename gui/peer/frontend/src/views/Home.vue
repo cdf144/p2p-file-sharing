@@ -12,7 +12,7 @@ import {
     StopPeerLogic,
     UpdatePeerConfig,
 } from '../../wailsjs/go/main/App';
-import { corepeer, protocol } from '../../wailsjs/go/models';
+import { corepeer, main, protocol } from '../../wailsjs/go/models';
 import { EventsOn, LogError } from '../../wailsjs/runtime/runtime';
 import NetworkDiscovery from '../components/NetworkDiscovery.vue';
 import NetworkFilesTable from '../components/NetworkFilesTable.vue';
@@ -48,6 +48,8 @@ const peerListState = reactive({
     peers: [] as corepeer.PeerRegistryInfo[],
     isLoading: false,
 });
+
+const downloadProgressMap = reactive<Record<string, main.DownloadProgressEvent>>({});
 
 async function handleSelectDirectory() {
     try {
@@ -157,7 +159,16 @@ async function downloadFile(file: protocol.FileMeta) {
         }
 
         await refreshPeerList();
-        peerState.statusMessage = `Downloading ${file.name} from peer...`;
+
+        downloadProgressMap[file.checksum] = {
+            fileChecksum: file.checksum,
+            fileName: file.name,
+            downloadedChunks: 0,
+            totalChunks: file.numChunks,
+            isComplete: false,
+        };
+
+        peerState.statusMessage = `Downloading ${file.name}...`;
         const result = await DownloadFileWithDialog(file.checksum, file.name);
         peerState.statusMessage = result;
     } catch (error: any) {
@@ -197,6 +208,7 @@ async function refreshPeerListLoop() {
 
 let unsubscribeFilesScanned: (() => void) | undefined;
 let unsubscribePeerConfigUpdated: (() => void) | undefined;
+let unsubscribeDownloadProgress: (() => void) | undefined;
 
 onMounted(async () => {
     try {
@@ -226,6 +238,27 @@ onMounted(async () => {
         peerConfig.servePort = config.ServePort;
         peerConfig.publicPort = config.PublicPort;
     });
+    unsubscribeDownloadProgress = EventsOn('downloadProgress', (progress: main.DownloadProgressEvent) => {
+        if (progress && progress.fileChecksum) {
+            const existingProgress = downloadProgressMap[progress.fileChecksum];
+            if (existingProgress) {
+                downloadProgressMap[progress.fileChecksum] = {
+                    ...existingProgress,
+                    ...progress,
+                };
+            } else {
+                downloadProgressMap[progress.fileChecksum] = progress;
+            }
+
+            if (progress.isComplete) {
+                setTimeout(() => {
+                    if (downloadProgressMap[progress.fileChecksum]?.isComplete) {
+                        delete downloadProgressMap[progress.fileChecksum];
+                    }
+                }, 5000);
+            }
+        }
+    });
 });
 
 onUnmounted(() => {
@@ -234,6 +267,9 @@ onUnmounted(() => {
     }
     if (unsubscribePeerConfigUpdated) {
         unsubscribePeerConfigUpdated();
+    }
+    if (unsubscribeDownloadProgress) {
+        unsubscribeDownloadProgress();
     }
     stopRefreshPeerLoop = true;
     if (refreshPeerTimeoutId) {
@@ -268,7 +304,11 @@ onUnmounted(() => {
         @discover-peers="queryNetwork"
     />
 
-    <NetworkFilesTable :network-files="networkState.networkFiles" @download-file="downloadFile" />
+    <NetworkFilesTable
+        :network-files="networkState.networkFiles"
+        :download-progress="downloadProgressMap"
+        @download-file="downloadFile"
+    />
 
     <SharedFilesTable :shared-files="peerState.sharedFiles" :share-dir="peerConfig.shareDir" />
 </template>

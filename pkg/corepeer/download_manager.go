@@ -27,6 +27,8 @@ const (
 	PEER_CONNECTION_TIMEOUT           = 10 * time.Second
 )
 
+type ProgressCallback func(fileChecksum string, fileName string, downloadedChunks int, totalChunks int, isComplete bool, errorMessage string)
+
 type DownloadManager struct {
 	logger       *log.Logger
 	indexClient  *IndexClient
@@ -41,7 +43,9 @@ func NewDownloadManager(logger *log.Logger, indexClient *IndexClient, peerRegist
 	}
 }
 
-func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
+func (dm *DownloadManager) DownloadFile(
+	ctx context.Context, fileMeta protocol.FileMeta, savePath string, progressCb ProgressCallback,
+) error {
 	var peers []netip.AddrPort
 
 	registryPeers := dm.peerRegistry.GetPeersWithFile(fileMeta.Checksum)
@@ -113,7 +117,6 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 		return fmt.Errorf("failed to pre-allocate file size for %s: %w", savePath, err)
 	}
 
-	downloadedChunkData := make([][]byte, fileMeta.NumChunks)
 	chunksPending := make(map[int]struct{})
 	for i := range fileMeta.NumChunks {
 		chunksPending[i] = struct{}{}
@@ -122,6 +125,10 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 
 	downloadPasses := 0
 	maxDownloadPasses := len(peers) + 2 // Extra passes for retries (arbitrary number, can be tuned)
+	successfullyDownloadedChunks := 0
+	if progressCb != nil {
+		progressCb(fileMeta.Checksum, fileMeta.Name, 0, fileMeta.NumChunks, false, "")
+	}
 
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -178,8 +185,10 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 		for jobsProcessed < expectedJobs {
 			select {
 			case <-ctx.Done():
-				dm.logger.Printf("Download context cancelled during pass %d results processing: %v", downloadPasses, ctx.Err())
-				err = ctx.Err()
+				err = fmt.Errorf("download context cancelled during pass %d: %w", downloadPasses, ctx.Err())
+				if progressCb != nil {
+					progressCb(fileMeta.Checksum, fileMeta.Name, successfullyDownloadedChunks, fileMeta.NumChunks, true, err.Error())
+				}
 				break passResultLoop
 			case res, ok := <-resultsChan:
 				if !ok { // Should not happen if workersWg is handled correctly
@@ -222,7 +231,6 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 					continue
 				}
 
-				downloadedChunkData[res.index] = res.data
 				offset := int64(res.index) * fileMeta.ChunkSize
 				_, writeErr := file.WriteAt(res.data, offset)
 				if writeErr != nil {
@@ -235,9 +243,13 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 				}
 
 				dm.logger.Printf("Pass %d: Successfully processed chunk %d for %s.", downloadPasses, res.index, fileMeta.Name)
+				successfullyDownloadedChunks++
 				dm.peerRegistry.RecordPeerActivity(res.peer)
 				delete(chunksPending, res.index)
 				delete(chunkFailureCounts, res.index)
+				if progressCb != nil {
+					progressCb(fileMeta.Checksum, fileMeta.Name, successfullyDownloadedChunks, fileMeta.NumChunks, false, "")
+				}
 			}
 		}
 		if err != nil { // Context cancelled or other break from loop
@@ -266,10 +278,14 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 	}
 
 	if len(chunksPending) > 0 {
-		return fmt.Errorf(
-			"failed to download all chunks for %s after %d passes. %d chunks remain.",
+		err = fmt.Errorf(
+			"failed to download all chunks for %s after %d passes. %d chunks remain",
 			fileMeta.Name, downloadPasses, len(chunksPending),
 		)
+		if progressCb != nil {
+			progressCb(fileMeta.Checksum, fileMeta.Name, successfullyDownloadedChunks, fileMeta.NumChunks, true, err.Error())
+		}
+		return err
 	}
 
 	dm.logger.Printf(
@@ -290,12 +306,19 @@ func (dm *DownloadManager) DownloadFile(ctx context.Context, fileMeta protocol.F
 
 	receivedFullChecksum := hex.EncodeToString(fullFileHasher.Sum(nil))
 	if receivedFullChecksum != fileMeta.Checksum {
-		return fmt.Errorf(
+		err = fmt.Errorf(
 			"overall checksum mismatch for %s: expected %s, actual %s",
 			fileMeta.Name, fileMeta.Checksum, receivedFullChecksum,
 		)
+		if progressCb != nil {
+			progressCb(fileMeta.Checksum, fileMeta.Name, successfullyDownloadedChunks, fileMeta.NumChunks, true, err.Error())
+		}
+		return err
 	}
 
+	if progressCb != nil {
+		progressCb(fileMeta.Checksum, fileMeta.Name, successfullyDownloadedChunks, fileMeta.NumChunks, true, "")
+	}
 	dm.logger.Printf("Successfully downloaded and verified file %s (%d chunks) to %s.", fileMeta.Name, fileMeta.NumChunks, savePath)
 	return nil
 }

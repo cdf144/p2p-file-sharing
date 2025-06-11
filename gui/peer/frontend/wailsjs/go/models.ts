@@ -61,6 +61,33 @@ export namespace corepeer {
 
 }
 
+export namespace main {
+	
+	export class DownloadProgressEvent {
+	    fileChecksum: string;
+	    fileName: string;
+	    downloadedChunks: number;
+	    totalChunks: number;
+	    isComplete: boolean;
+	    errorMessage?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DownloadProgressEvent(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fileChecksum = source["fileChecksum"];
+	        this.fileName = source["fileName"];
+	        this.downloadedChunks = source["downloadedChunks"];
+	        this.totalChunks = source["totalChunks"];
+	        this.isComplete = source["isComplete"];
+	        this.errorMessage = source["errorMessage"];
+	    }
+	}
+
+}
+
 export namespace netip {
 	
 	export class AddrPort {

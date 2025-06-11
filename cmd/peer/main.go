@@ -144,7 +144,7 @@ func main() {
 		log.Printf("Attempting to download file: %s (Size: %d bytes)\n", fileMeta.Name, fileMeta.Size)
 		log.Printf("Saving to: %s\n", absSavePath)
 
-		err = corePeer.DownloadFile(ctx, fileMeta, absSavePath)
+		err = corePeer.DownloadFile(ctx, fileMeta, absSavePath, nil)
 		if err != nil {
 			log.Fatalf("Error downloading file: %v", err)
 		}

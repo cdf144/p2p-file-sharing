@@ -257,8 +257,10 @@ func (p *CorePeer) FetchFileFromIndex(ctx context.Context, fileChecksum string) 
 
 // DownloadFile orchestrates the download of a file in chunks from multiple peers.
 // It manages sessions with peers and retries failed chunks.
-func (p *CorePeer) DownloadFile(ctx context.Context, fileMeta protocol.FileMeta, savePath string) error {
-	return p.downloadManager.DownloadFile(ctx, fileMeta, savePath)
+func (p *CorePeer) DownloadFile(
+	ctx context.Context, fileMeta protocol.FileMeta, savePath string, progressCb ProgressCallback,
+) error {
+	return p.downloadManager.DownloadFile(ctx, fileMeta, savePath, progressCb)
 }
 
 func (p *CorePeer) GetConnectedPeers() map[netip.AddrPort]*PeerRegistryInfo {
