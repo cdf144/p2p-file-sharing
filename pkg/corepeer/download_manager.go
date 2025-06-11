@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -46,7 +47,7 @@ func NewDownloadManager(logger *log.Logger, indexClient *IndexClient, peerRegist
 func (dm *DownloadManager) DownloadFile(
 	ctx context.Context, fileMeta protocol.FileMeta, savePath string, progressCb ProgressCallback,
 ) error {
-	var peers []netip.AddrPort
+	var peers []protocol.PeerInfoSummary
 
 	registryPeers := dm.peerRegistry.GetPeersWithFile(fileMeta.Checksum)
 	if len(registryPeers) > 0 {
@@ -64,8 +65,8 @@ func (dm *DownloadManager) DownloadFile(
 			return fmt.Errorf("no peers found for file %s (checksum: %s) from index or registry", fileMeta.Name, fileMeta.Checksum)
 		}
 		peers = indexQueriedPeers
-		for _, addr := range peers {
-			dm.peerRegistry.AddPeer(addr, []protocol.FileMeta{fileMeta})
+		for _, peer := range peers {
+			dm.peerRegistry.AddPeer(peer.Address, []protocol.FileMeta{fileMeta}, peer.TLS)
 		}
 	}
 
@@ -161,7 +162,7 @@ func (dm *DownloadManager) DownloadFile(
 		resultsChan := make(chan chunkDownloadResult, fileMeta.NumChunks)
 		var workersWg sync.WaitGroup
 
-		shuffledPeers := make([]netip.AddrPort, len(peers))
+		shuffledPeers := make([]protocol.PeerInfoSummary, len(peers))
 		copy(shuffledPeers, peers)
 		rand.Shuffle(len(shuffledPeers), func(i, j int) { shuffledPeers[i], shuffledPeers[j] = shuffledPeers[j], shuffledPeers[i] })
 
@@ -173,9 +174,9 @@ func (dm *DownloadManager) DownloadFile(
 		dm.logger.Printf("Pass %d: Launching %d workers for %d jobs.", downloadPasses, numWorkers, len(chunkJobQueue))
 
 		for i := range numWorkers {
-			peerAddr := shuffledPeers[i%len(shuffledPeers)]
+			peer := shuffledPeers[i%len(shuffledPeers)]
 			workersWg.Add(1)
-			go dm.runPeerDownloadSession(ctx, peerAddr, fileMeta, chunkJobQueue, resultsChan, &workersWg)
+			go dm.runPeerDownloadSession(ctx, peer.Address, fileMeta, chunkJobQueue, resultsChan, &workersWg)
 		}
 
 		jobsProcessed := 0
@@ -339,7 +340,27 @@ func (dm *DownloadManager) runPeerDownloadSession(
 
 	dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusConnecting)
 
-	conn, err := net.DialTimeout("tcp", peerAddr.String(), PEER_CONNECTION_TIMEOUT)
+	peerInfo := dm.peerRegistry.GetPeerInfo(peerAddr)
+
+	var conn net.Conn
+	var err error
+	if peerInfo != nil && peerInfo.TLS {
+		dm.logger.Printf("Establishing TLS connection to peer %s", peerAddr)
+		tlsConfig := &tls.Config{
+			// NOTE: Not suitable for production use, as it skips certificate verification.
+			InsecureSkipVerify: true,
+			ServerName:         peerAddr.Addr().String(),
+		}
+		conn, err = tls.DialWithDialer(
+			&net.Dialer{Timeout: PEER_CONNECTION_TIMEOUT},
+			"tcp",
+			peerAddr.String(),
+			tlsConfig,
+		)
+	} else {
+		dm.logger.Printf("Establishing TCP connection to peer %s", peerAddr)
+		conn, err = net.DialTimeout("tcp", peerAddr.String(), PEER_CONNECTION_TIMEOUT)
+	}
 	if err != nil {
 		dm.logger.Printf(
 			"Worker for %s: failed to connect to peer %s: %v. This worker will not process jobs.",
@@ -348,6 +369,7 @@ func (dm *DownloadManager) runPeerDownloadSession(
 		dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusUnreachable)
 		return
 	}
+
 	defer func() {
 		conn.Close()
 		dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusDisconnected)

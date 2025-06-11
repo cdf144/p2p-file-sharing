@@ -12,6 +12,7 @@ import (
 type PeerInfo struct {
 	Address netip.AddrPort `json:"address" ts_type:"string"`
 	Files   []FileMeta     `json:"files"`
+	TLS     bool           `json:"tls"`
 }
 
 // PeerInfoSummary provides a summary of a peer's information,
@@ -20,6 +21,7 @@ type PeerInfo struct {
 type PeerInfoSummary struct {
 	Address   netip.AddrPort `json:"address" ts_type:"string"`
 	FileCount int            `json:"fileCount"`
+	TLS       bool           `json:"tls"`
 }
 
 // FileMeta represents the metadata of a file shared by a peer in the P2P network.

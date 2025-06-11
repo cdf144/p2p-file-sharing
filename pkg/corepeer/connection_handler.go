@@ -2,6 +2,7 @@ package corepeer
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -37,9 +38,18 @@ func NewConnectionHandler(logger *log.Logger, fileManager *FileManager, peerRegi
 func (c *ConnectionHandler) HandleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	isTLS := false
+	if _, ok := conn.(*tls.Conn); ok {
+		isTLS = true
+		c.logger.Printf("Handling TLS connection from %s", conn.RemoteAddr().String())
+	} else {
+		c.logger.Printf("Handling TCP connection from %s", conn.RemoteAddr().String())
+	}
+
 	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
 		if addr, err := netip.ParseAddrPort(tcpAddr.String()); err == nil {
 			c.peerRegistry.UpdatePeerStatus(addr, PeerStatusConnected)
+			c.peerRegistry.UpdatePeerTLS(addr, isTLS)
 			defer c.peerRegistry.UpdatePeerStatus(addr, PeerStatusDisconnected)
 		}
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/netip"
 
@@ -106,9 +107,46 @@ func (a *App) SelectShareDirectory() (string, error) {
 	return dir, nil
 }
 
-func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort int) error {
+func (a *App) SelectCertificateFile() (string, error) {
+	file, err := wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{
+		Title: "Select TLS Certificate File",
+		Filters: []wruntime.FileFilter{
+			{DisplayName: "Certificate Files (*.crt, *.pem)", Pattern: "*.crt;*.pem"},
+			{DisplayName: "All Files", Pattern: "*"},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to select certificate file: %w", err)
+	}
+	return file, nil
+}
+
+func (a *App) SelectPrivateKeyFile() (string, error) {
+	file, err := wruntime.OpenFileDialog(a.ctx, wruntime.OpenDialogOptions{
+		Title: "Select TLS Private Key File",
+		Filters: []wruntime.FileFilter{
+			{DisplayName: "Private Key Files (*.key, *.pem)", Pattern: "*.key;*.pem"},
+			{DisplayName: "All Files", Pattern: "*"},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to select private key file: %w", err)
+	}
+	return file, nil
+}
+
+func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort int, enableTLS bool, certFile, keyFile string) error {
 	if a.corePeer == nil {
 		return fmt.Errorf("CorePeer not initialized")
+	}
+
+	if enableTLS {
+		if certFile == "" || keyFile == "" {
+			return fmt.Errorf("TLS enabled but certificate or private key file is missing")
+		}
+		if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+			return fmt.Errorf("failed to load TLS certificate pair: %w", err)
+		}
 	}
 
 	newConfig := corepeer.CorePeerConfig{
@@ -116,6 +154,9 @@ func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort 
 		ShareDir:   shareDir,
 		ServePort:  servePort,
 		PublicPort: publicPort,
+		TLS:        enableTLS,
+		CertFile:   certFile,
+		KeyFile:    keyFile,
 	}
 
 	var updatedConfig corepeer.CorePeerConfig
@@ -131,17 +172,26 @@ func (a *App) UpdatePeerConfig(indexURL, shareDir string, servePort, publicPort 
 
 	wruntime.LogInfof(
 		a.ctx,
-		"[peer] Updated CorePeer config with IndexURL: %s, ShareDir: %s, ServePort: %d, PublicPort: %d",
-		indexURL, shareDir, servePort, publicPort,
+		"[peer] Updated CorePeer config with IndexURL: %s, ShareDir: %s, ServePort: %d, PublicPort: %d, TLS: %t",
+		indexURL, shareDir, servePort, publicPort, enableTLS,
 	)
 
 	return nil
 }
 
-func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort int) error {
+func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort int, enableTLS bool, certFile, keyFile string) error {
 	if a.corePeer.IsServing() {
 		wruntime.EventsEmit(a.ctx, "peerConfigUpdated", a.corePeer.GetConfig())
 		return nil
+	}
+
+	if enableTLS {
+		if certFile == "" || keyFile == "" {
+			return fmt.Errorf("TLS enabled but certificate or private key file is missing")
+		}
+		if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+			return fmt.Errorf("failed to load TLS certificate pair: %w", err)
+		}
 	}
 
 	config := corepeer.CorePeerConfig{
@@ -163,8 +213,8 @@ func (a *App) StartPeerLogic(indexURL, shareDir string, servePort, publicPort in
 	wruntime.EventsEmit(a.ctx, "filesScanned", a.corePeer.GetSharedFiles())
 	wruntime.LogInfof(
 		a.ctx,
-		"[peer] Starting CorePeer with IndexURL: %s, ShareDir: %s, ServePort: %d, PublicPort: %d",
-		indexURL, shareDir, servePort, publicPort,
+		"[peer] Starting CorePeer with IndexURL: %s, ShareDir: %s, ServePort: %d, PublicPort: %d, TLS: %t",
+		indexURL, shareDir, servePort, publicPort, enableTLS,
 	)
 
 	statusMsg, err := a.corePeer.Start(a.ctx)
@@ -210,7 +260,7 @@ func (a *App) FetchNetworkFiles() ([]protocol.FileMeta, error) {
 	return files, nil
 }
 
-func (a *App) FetchPeersForFile(checksum string) ([]netip.AddrPort, error) {
+func (a *App) FetchPeersForFile(checksum string) ([]protocol.PeerInfoSummary, error) {
 	wruntime.LogInfof(a.ctx, "[peer] Fetching peers for file with checksum: %s", checksum)
 	if a.corePeer == nil { // Should be initialized in startup, but just in case
 		return nil, fmt.Errorf("CorePeer not initialized")

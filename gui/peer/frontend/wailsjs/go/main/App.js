@@ -34,18 +34,26 @@ export function GetCurrentSharedFiles() {
   return window['go']['main']['App']['GetCurrentSharedFiles']();
 }
 
+export function SelectCertificateFile() {
+  return window['go']['main']['App']['SelectCertificateFile']();
+}
+
+export function SelectPrivateKeyFile() {
+  return window['go']['main']['App']['SelectPrivateKeyFile']();
+}
+
 export function SelectShareDirectory() {
   return window['go']['main']['App']['SelectShareDirectory']();
 }
 
-export function StartPeerLogic(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['StartPeerLogic'](arg1, arg2, arg3, arg4);
+export function StartPeerLogic(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['StartPeerLogic'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
 export function StopPeerLogic() {
   return window['go']['main']['App']['StopPeerLogic']();
 }
 
-export function UpdatePeerConfig(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['UpdatePeerConfig'](arg1, arg2, arg3, arg4);
+export function UpdatePeerConfig(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['UpdatePeerConfig'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }

@@ -31,7 +31,7 @@ func NewIndexClient(indexURL string, logger *log.Logger) *IndexClient {
 }
 
 // Announce sends peer information to the index server.
-func (ic *IndexClient) Announce(peerAddr netip.AddrPort, sharedFiles []protocol.FileMeta) error {
+func (ic *IndexClient) Announce(peerAddr netip.AddrPort, sharedFiles []protocol.FileMeta, tls bool) error {
 	if ic.indexURL == "" {
 		ic.logger.Println("IndexURL is not configured. Skipping announce.")
 		return nil
@@ -40,6 +40,7 @@ func (ic *IndexClient) Announce(peerAddr netip.AddrPort, sharedFiles []protocol.
 	peerInfo := protocol.PeerInfo{
 		Address: peerAddr,
 		Files:   sharedFiles,
+		TLS:     tls,
 	}
 	jsonData, err := json.Marshal(peerInfo)
 	if err != nil {
@@ -108,7 +109,7 @@ func (ic *IndexClient) Deannounce(peerAddr netip.AddrPort) error {
 }
 
 // Reannounce sends the peer's updated information to the index server.
-func (ic *IndexClient) Reannounce(peerAddr netip.AddrPort, sharedFiles []protocol.FileMeta) error {
+func (ic *IndexClient) Reannounce(peerAddr netip.AddrPort, sharedFiles []protocol.FileMeta, tls bool) error {
 	if ic.indexURL == "" {
 		ic.logger.Println("IndexURL is not configured. Skipping re-announce.")
 		return nil
@@ -120,6 +121,7 @@ func (ic *IndexClient) Reannounce(peerAddr netip.AddrPort, sharedFiles []protoco
 	peerInfo := protocol.PeerInfo{
 		Address: peerAddr,
 		Files:   sharedFiles,
+		TLS:     tls,
 	}
 	reannounceURL := ic.indexURL + "/peers/reannounce"
 
@@ -235,7 +237,7 @@ func (ic *IndexClient) FetchOneFile(ctx context.Context, checksum string) (proto
 }
 
 // QueryFilePeers retrieves a list of peers that are serving a specific file by its checksum.
-func (ic *IndexClient) QueryFilePeers(ctx context.Context, checksum string) ([]netip.AddrPort, error) {
+func (ic *IndexClient) QueryFilePeers(ctx context.Context, checksum string) ([]protocol.PeerInfoSummary, error) {
 	if ic.indexURL == "" {
 		return nil, fmt.Errorf("index URL is not configured")
 	}
@@ -264,12 +266,12 @@ func (ic *IndexClient) QueryFilePeers(ctx context.Context, checksum string) ([]n
 		return nil, fmt.Errorf("server returned status %s: %s", resp.Status, string(respBody))
 	}
 
-	var peerAddrs []netip.AddrPort
-	if err := json.NewDecoder(resp.Body).Decode(&peerAddrs); err != nil {
+	var peerSummaries []protocol.PeerInfoSummary
+	if err := json.NewDecoder(resp.Body).Decode(&peerSummaries); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	ic.logger.Printf("Found %d peers for file with checksum %s", len(peerAddrs), checksum)
-	return peerAddrs, nil
+	ic.logger.Printf("Found %d peers for file with checksum %s", len(peerSummaries), checksum)
+	return peerSummaries, nil
 }
 
 func (ic *IndexClient) SetIndexURL(indexURL string) {

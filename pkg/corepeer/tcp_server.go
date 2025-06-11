@@ -2,6 +2,7 @@ package corepeer
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -30,9 +31,10 @@ func (ts *TCPServer) IsRunning() bool {
 }
 
 // Start initializes the TCP server, binds it to the specified port, and starts accepting connections.
+// If enableTLS is true, certFile and keyFile must be valid paths to PEM-encoded files.
 // The server will continue to run until the context is cancelled or an error occurs during listening.
 // If a listener already exists, it will not start a new one and returns with no error.
-func (ts *TCPServer) Start(ctx context.Context, port int) error {
+func (ts *TCPServer) Start(ctx context.Context, port int, enableTLS bool, certFile, keyFile string) error {
 	if ts.listener != nil {
 		ts.logger.Println("TCP server already running or listener already exists.")
 		return nil
@@ -41,11 +43,34 @@ func (ts *TCPServer) Start(ctx context.Context, port int) error {
 		return fmt.Errorf("cannot start TCP server, context is not active or nil")
 	}
 
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %w", port, err)
+	var l net.Listener
+	var err error
+	listenAddr := fmt.Sprintf(":%d", port)
+
+	if enableTLS {
+		if certFile == "" || keyFile == "" {
+			return fmt.Errorf("TLS enabled but certFile or keyFile not provided")
+		}
+		cert, errLoad := tls.LoadX509KeyPair(certFile, keyFile)
+		if errLoad != nil {
+			return fmt.Errorf("failed to load TLS key pair: %w", errLoad)
+		}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		l, err = tls.Listen("tcp", listenAddr, tlsConfig)
+		if err != nil {
+			return fmt.Errorf("failed to listen with TLS on port %d: %w", port, err)
+		}
+		ts.logger.Printf("TCP server started with TLS on port: %d", port)
+	} else {
+		l, err = net.Listen("tcp", listenAddr)
+		if err != nil {
+			return fmt.Errorf("failed to listen on port %d: %w", port, err)
+		}
+		ts.logger.Printf("TCP server started (no TLS) on port: %d", port)
 	}
-	ts.logger.Printf("TCP server started on port: %d", port)
 
 	ts.listener = l
 	ts.serveCtx, ts.serveCancel = context.WithCancel(ctx)
@@ -75,14 +100,16 @@ func (ts *TCPServer) Stop() {
 // It starts the TCP server if it should be running but isn't currently running or if the listener is nil.
 // It stops the TCP server if it shouldn't be running but is currently running.
 // Returns an error if starting the TCP server fails.
-func (ts *TCPServer) UpdateState(ctx context.Context, shouldBeRunning, wasRunning bool, port int) error {
+func (ts *TCPServer) UpdateState(
+	ctx context.Context, shouldBeRunning, wasRunning bool, port int, tls bool, certFile, keyFile string,
+) error {
 	if shouldBeRunning && (!wasRunning || ts.listener == nil) {
 		ts.logger.Printf("Starting TCP server for sharing directory: %s", ts.fileManager.GetShareDir())
 		if ctx == nil {
 			ts.logger.Println("Error: peerRootCtx is nil, cannot start TCP server. Peer might not have been started correctly.")
 			return fmt.Errorf("peerRootCtx is nil, cannot start TCP server")
 		}
-		return ts.Start(ctx, port)
+		return ts.Start(ctx, port, tls, certFile, keyFile)
 	} else if !shouldBeRunning && wasRunning {
 		ts.logger.Println("Stopping TCP server - no directory to share.")
 		ts.Stop()

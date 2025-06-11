@@ -2,6 +2,7 @@ package corepeer
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -12,15 +13,17 @@ import (
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
 )
 
-// TODO: Implement progress reporting and connections tracking.
 // TODO: Implement optional secure connections (TLS) for file transfers.
 
 // CorePeerConfig holds configuration for the CorePeer.
 type CorePeerConfig struct {
 	IndexURL   string
 	ShareDir   string
-	ServePort  int // 0 for random
-	PublicPort int // 0 to use ServePort for announcement
+	ServePort  int    // 0 for random
+	PublicPort int    // 0 to use ServePort for announcement
+	TLS        bool   `json:"tls"`
+	CertFile   string `json:"certFile"`
+	KeyFile    string `json:"keyFile"`
 }
 
 // CorePeer manages the core P2P logic.
@@ -59,7 +62,9 @@ func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 	p.connectionHandler = NewConnectionHandler(logger, p.fileManager, p.peerRegistry)
 	p.tcpServer = NewTCPServer(logger, p.connectionHandler, p.fileManager)
 
-	p.UpdateConfig(context.Background(), cfg)
+	if _, err := p.UpdateConfig(context.Background(), cfg); err != nil {
+		logger.Printf("Error during initial config update in NewCorePeer: %v", err)
+	}
 	return p
 }
 
@@ -91,7 +96,9 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	}
 	p.logger.Printf("Using serve port: %d", p.config.ServePort)
 	if p.config.ShareDir != "" {
-		p.tcpServer.Start(ctx, p.config.ServePort)
+		if err := p.tcpServer.Start(ctx, p.config.ServePort, p.config.TLS, p.config.CertFile, p.config.KeyFile); err != nil {
+			return "", fmt.Errorf("failed to start TCP server: %w", err)
+		}
 	}
 
 	// 3. Announce to index server
@@ -104,7 +111,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	p.logger.Printf("Announcing with port: %d", announcePort)
 
 	p.announcedAddr = netip.AddrPortFrom(announceIP, announcePort)
-	if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
+	if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles(), p.config.TLS); err != nil {
 		p.tcpServer.Stop()
 		return "", fmt.Errorf("failed to announce to index server: %w", err)
 	}
@@ -202,6 +209,20 @@ func (p *CorePeer) UpdateConfig(ctx context.Context, newConfig CorePeerConfig) (
 		return p.config, fmt.Errorf("failed to handle share directory change: %w", err)
 	}
 
+	tlsSettingsChanged := oldConfig.TLS != newConfig.TLS ||
+		oldConfig.CertFile != newConfig.CertFile ||
+		oldConfig.KeyFile != newConfig.KeyFile
+
+	if tlsSettingsChanged {
+		if err := p.validateTLSConfig(); err != nil {
+			return p.config, fmt.Errorf("TLS configuration validation failed: %w", err)
+		}
+		p.config.TLS = newConfig.TLS
+		p.config.CertFile = newConfig.CertFile
+		p.config.KeyFile = newConfig.KeyFile
+		p.logger.Printf("TLS configuration changed: EnableTLS=%t, CertFile=%s, KeyFile=%s", p.config.TLS, p.config.CertFile, p.config.KeyFile)
+	}
+
 	if err := p.handleServePortChange(oldConfig.ServePort, newConfig.ServePort); err != nil {
 		return p.config, fmt.Errorf("failed to handle serve port change: %w", err)
 	}
@@ -246,7 +267,7 @@ func (p *CorePeer) FetchFilesFromIndex(ctx context.Context) ([]protocol.FileMeta
 }
 
 // QueryPeersForFile retrieves a list of peers that are serving a specific file by its checksum.
-func (p *CorePeer) QueryPeersForFile(ctx context.Context, checksum string) ([]netip.AddrPort, error) {
+func (p *CorePeer) QueryPeersForFile(ctx context.Context, checksum string) ([]protocol.PeerInfoSummary, error) {
 	return p.indexClient.QueryFilePeers(ctx, checksum)
 }
 
@@ -289,7 +310,7 @@ func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 	p.logger.Printf("IndexClient updated with new URL: %s", newIndexURL)
 
 	if p.isServing && newIndexURL != "" {
-		if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
+		if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles(), p.config.TLS); err != nil {
 			return fmt.Errorf("failed to re-announce to new index URL %s: %w", newIndexURL, err)
 		}
 	}
@@ -334,11 +355,14 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 	}
 
 	if p.isServing {
-		if err := p.tcpServer.UpdateState(ctx, willNowShareFromDir, wasPreviouslySharingFromDir, p.config.ServePort); err != nil {
+		err := p.tcpServer.UpdateState(
+			ctx, willNowShareFromDir, wasPreviouslySharingFromDir, p.config.ServePort, p.config.TLS, p.config.CertFile, p.config.KeyFile,
+		)
+		if err != nil {
 			p.config.ShareDir = oldShareDir
 			return err
 		}
-		if err := p.indexClient.Reannounce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
+		if err := p.indexClient.Reannounce(p.announcedAddr, p.fileManager.GetSharedFiles(), p.config.TLS); err != nil {
 			p.logger.Printf("Warning: Failed to re-announce after share directory update: %v", err)
 		}
 	}
@@ -373,7 +397,8 @@ func (p *CorePeer) handleServePortChange(oldServePort, newServePort int) error {
 
 	p.tcpServer.Stop()
 	if p.config.ShareDir != "" {
-		if err := p.tcpServer.Start(p.rootCtx, p.config.ServePort); err != nil {
+		err := p.tcpServer.Start(p.rootCtx, p.config.ServePort, p.config.TLS, p.config.CertFile, p.config.KeyFile)
+		if err != nil {
 			return fmt.Errorf("failed to restart TCP server on new port %d: %w", newServePort, err)
 		}
 	}
@@ -404,7 +429,8 @@ func (p *CorePeer) handlePublicPortChange(oldPublicPort, newPublicPort int) erro
 	p.logger.Printf("De-announced from index server due to public port change from %d to %d", oldPublicPort, newPublicPort)
 
 	p.announcedAddr = netip.AddrPortFrom(p.announcedAddr.Addr(), uint16(newPublicPort))
-	if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
+	err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles(), p.config.TLS)
+	if err != nil {
 		return fmt.Errorf("failed to re-announce to index server with new public port %d: %w", newPublicPort, err)
 	}
 	p.logger.Printf("Re-announced to index server with new public port: %d", newPublicPort)
@@ -445,7 +471,7 @@ func (p *CorePeer) populatePeerRegistryFromIndex(ctx context.Context) error {
 		return fmt.Errorf("failed to fetch files from index: %w", err)
 	}
 
-	peerFiles := make(map[netip.AddrPort][]protocol.FileMeta)
+	peerFiles := make(map[protocol.PeerInfoSummary][]protocol.FileMeta)
 
 	for _, file := range files {
 		peers, err := p.indexClient.QueryFilePeers(ctx, file.Checksum)
@@ -453,21 +479,35 @@ func (p *CorePeer) populatePeerRegistryFromIndex(ctx context.Context) error {
 			continue
 		}
 
-		for _, peerAddr := range peers {
-			if peerAddr != p.announcedAddr {
-				peerFiles[peerAddr] = append(peerFiles[peerAddr], file)
+		for _, peer := range peers {
+			if peer.Address != p.announcedAddr {
+				peerFiles[peer] = append(peerFiles[peer], file)
 			}
 		}
 	}
 
 	existingPeers := p.peerRegistry.GetPeers()
-	for addr, files := range peerFiles {
+	for peer, files := range peerFiles {
 		// Don't refresh existing peers since it'll mess up their last seen timestamps.
-		if _, ok := existingPeers[addr]; !ok {
-			p.peerRegistry.AddPeer(addr, files)
+		if _, ok := existingPeers[peer.Address]; !ok {
+			p.peerRegistry.AddPeer(peer.Address, files, peer.TLS)
 		}
 	}
 
 	p.logger.Printf("Populated peer registry with %d peers from index server", len(peerFiles))
+	return nil
+}
+
+func (p *CorePeer) validateTLSConfig() error {
+	if !p.config.TLS {
+		return nil
+	}
+	if p.config.CertFile == "" || p.config.KeyFile == "" {
+		return fmt.Errorf("TLS enabled but certificate or key file not specified")
+	}
+	// Validate that certificate files exist and are readable
+	if _, err := tls.LoadX509KeyPair(p.config.CertFile, p.config.KeyFile); err != nil {
+		return fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
 	return nil
 }

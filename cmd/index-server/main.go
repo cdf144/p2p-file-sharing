@@ -306,13 +306,17 @@ func (s *IndexServer) handleGetOneFilePeers(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	peerAddresses := make([]netip.AddrPort, 0, len(peers))
+	peerSummaries := make([]protocol.PeerInfoSummary, 0, len(peers))
 	for _, peer := range peers {
-		peerAddresses = append(peerAddresses, peer.Address)
+		peerSummaries = append(peerSummaries, protocol.PeerInfoSummary{
+			Address:   peer.Address,
+			FileCount: len(peer.Files),
+			TLS:       peer.TLS,
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(peerAddresses); err != nil {
+	if err := json.NewEncoder(w).Encode(peerSummaries); err != nil {
 		http.Error(w, "failed to encode response", http.StatusInternalServerError)
 		s.logger.Printf("Failed to encode response: %v", err)
 		return

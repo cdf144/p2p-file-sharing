@@ -5,6 +5,9 @@ export namespace corepeer {
 	    ShareDir: string;
 	    ServePort: number;
 	    PublicPort: number;
+	    tls: boolean;
+	    certFile: string;
+	    keyFile: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new CorePeerConfig(source);
@@ -16,6 +19,9 @@ export namespace corepeer {
 	        this.ShareDir = source["ShareDir"];
 	        this.ServePort = source["ServePort"];
 	        this.PublicPort = source["PublicPort"];
+	        this.tls = source["tls"];
+	        this.certFile = source["certFile"];
+	        this.keyFile = source["keyFile"];
 	    }
 	}
 	export class PeerRegistryInfo {
@@ -25,6 +31,7 @@ export namespace corepeer {
 	    connectedAt: Date;
 	    sharedFiles: protocol.FileMeta[];
 	    failureCount: number;
+	    tls: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new PeerRegistryInfo(source);
@@ -38,6 +45,7 @@ export namespace corepeer {
 	        this.connectedAt = source["connectedAt"];
 	        this.sharedFiles = this.convertValues(source["sharedFiles"], protocol.FileMeta);
 	        this.failureCount = source["failureCount"];
+	        this.tls = source["tls"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -88,23 +96,6 @@ export namespace main {
 
 }
 
-export namespace netip {
-	
-	export class AddrPort {
-	
-	
-	    static createFrom(source: any = {}) {
-	        return new AddrPort(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	
-	    }
-	}
-
-}
-
 export namespace protocol {
 	
 	export class FileMeta {
@@ -132,6 +123,7 @@ export namespace protocol {
 	export class PeerInfo {
 	    address: string;
 	    files: FileMeta[];
+	    tls: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new PeerInfo(source);
@@ -141,6 +133,7 @@ export namespace protocol {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.address = source["address"];
 	        this.files = this.convertValues(source["files"], FileMeta);
+	        this.tls = source["tls"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -160,6 +153,22 @@ export namespace protocol {
 		    }
 		    return a;
 		}
+	}
+	export class PeerInfoSummary {
+	    address: string;
+	    fileCount: number;
+	    tls: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new PeerInfoSummary(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.address = source["address"];
+	        this.fileCount = source["fileCount"];
+	        this.tls = source["tls"];
+	    }
 	}
 
 }

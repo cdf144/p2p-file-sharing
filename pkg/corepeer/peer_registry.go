@@ -41,16 +41,18 @@ type PeerRegistryInfo struct {
 	ConnectedAt  time.Time           `json:"connectedAt" ts_type:"Date"`
 	SharedFiles  []protocol.FileMeta `json:"sharedFiles"`
 	FailureCount int                 `json:"failureCount"`
+	TLS          bool                `json:"tls"`
 }
 
 type PeerRegistry struct {
-	mu             sync.RWMutex
-	peers          map[netip.AddrPort]*PeerRegistryInfo
-	logger         *log.Logger
-	eventCh        chan PeerEvent
-	internalCtx    context.Context // manages the lifecycle of the registry's own goroutines
-	internalCancel context.CancelFunc
-	loopsWg        sync.WaitGroup
+	mu                sync.RWMutex
+	peerRegistryInfos map[netip.AddrPort]*PeerRegistryInfo
+	peerSummaries     map[netip.AddrPort]protocol.PeerInfoSummary
+	logger            *log.Logger
+	eventCh           chan PeerEvent
+	internalCtx       context.Context // manages the lifecycle of the registry's own goroutines
+	internalCancel    context.CancelFunc
+	loopsWg           sync.WaitGroup
 }
 
 type PeerEvent struct {
@@ -63,11 +65,12 @@ func NewPeerRegistry(logger *log.Logger) *PeerRegistry {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	pr := &PeerRegistry{
-		peers:          make(map[netip.AddrPort]*PeerRegistryInfo),
-		logger:         logger,
-		eventCh:        make(chan PeerEvent, 100),
-		internalCtx:    ctx,
-		internalCancel: cancel,
+		peerRegistryInfos: make(map[netip.AddrPort]*PeerRegistryInfo),
+		peerSummaries:     make(map[netip.AddrPort]protocol.PeerInfoSummary),
+		logger:            logger,
+		eventCh:           make(chan PeerEvent, 100),
+		internalCtx:       ctx,
+		internalCancel:    cancel,
 	}
 
 	pr.logger.Println("PeerRegistry: Initializing and starting internal loops.")
@@ -98,23 +101,32 @@ func (pr *PeerRegistry) Shutdown() {
 	}
 }
 
-func (pr *PeerRegistry) AddPeer(addr netip.AddrPort, files []protocol.FileMeta) {
+func (pr *PeerRegistry) AddPeer(addr netip.AddrPort, files []protocol.FileMeta, tls bool) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	peer, ok := pr.peers[addr]
+	peerRegistryInfo, ok := pr.peerRegistryInfos[addr]
 	if !ok {
-		peer = &PeerRegistryInfo{
+		peerRegistryInfo = &PeerRegistryInfo{
 			Address:     addr,
 			Status:      PeerStatusDisconnected,
 			SharedFiles: files,
 			LastSeen:    time.Now(),
+			TLS:         tls,
 		}
-		pr.peers[addr] = peer
+		pr.peerRegistryInfos[addr] = peerRegistryInfo
+
+		peerSummary := protocol.PeerInfoSummary{
+			Address:   addr,
+			FileCount: len(files),
+			TLS:       tls,
+		}
+		pr.peerSummaries[addr] = peerSummary
+
 		pr.logger.Printf("Added new peer: %s (files: %d)", addr, len(files))
 	} else {
 		existingFilesMap := make(map[string]protocol.FileMeta)
-		for _, f := range peer.SharedFiles {
+		for _, f := range peerRegistryInfo.SharedFiles {
 			existingFilesMap[f.Checksum] = f
 		}
 		for _, newFile := range files {
@@ -124,9 +136,10 @@ func (pr *PeerRegistry) AddPeer(addr netip.AddrPort, files []protocol.FileMeta) 
 		for _, f := range existingFilesMap {
 			updatedFilesList = append(updatedFilesList, f)
 		}
-		peer.SharedFiles = updatedFilesList
-		peer.LastSeen = time.Now()
-		pr.logger.Printf("Updated peer: %s (total files: %d)", addr, len(peer.SharedFiles))
+		peerRegistryInfo.SharedFiles = updatedFilesList
+		peerRegistryInfo.LastSeen = time.Now()
+		peerRegistryInfo.TLS = tls
+		pr.logger.Printf("Updated peer: %s (total files: %d)", addr, len(peerRegistryInfo.SharedFiles))
 	}
 }
 
@@ -134,7 +147,7 @@ func (pr *PeerRegistry) UpdatePeerStatus(addr netip.AddrPort, status PeerStatus)
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	peer, ok := pr.peers[addr]
+	peer, ok := pr.peerRegistryInfos[addr]
 	if !ok {
 		pr.logger.Printf("Peer %s not found in registry. Creating new entry for status update to %v.", addr, status)
 		peer = &PeerRegistryInfo{
@@ -142,7 +155,7 @@ func (pr *PeerRegistry) UpdatePeerStatus(addr netip.AddrPort, status PeerStatus)
 			LastSeen:    time.Now(),
 			SharedFiles: []protocol.FileMeta{},
 		}
-		pr.peers[addr] = peer
+		pr.peerRegistryInfos[addr] = peer
 	}
 
 	oldStatus := peer.Status
@@ -163,13 +176,31 @@ func (pr *PeerRegistry) UpdatePeerStatus(addr netip.AddrPort, status PeerStatus)
 	pr.logger.Printf("Peer %s status changed: %v -> %v", addr, oldStatus, status)
 }
 
+func (pr *PeerRegistry) UpdatePeerTLS(addr netip.AddrPort, tls bool) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	peer, ok := pr.peerRegistryInfos[addr]
+	if !ok {
+		pr.logger.Printf("Peer %s not found in registry. Cannot update TLS status.", addr)
+		return
+	}
+	peer.TLS = tls
+
+	if summary, ok := pr.peerSummaries[addr]; ok {
+		summary.TLS = tls
+		pr.peerSummaries[addr] = summary
+	}
+	pr.logger.Printf("Updated TLS status for peer %s to %v", addr, tls)
+}
+
 // RecordPeerActivity updates the LastSeen timestamp for a peer, indicating recent interaction.
 // This helps prevent active peers from being prematurely marked as stale.
 func (pr *PeerRegistry) RecordPeerActivity(addr netip.AddrPort) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	if peer, ok := pr.peers[addr]; ok {
+	if peer, ok := pr.peerRegistryInfos[addr]; ok {
 		peer.LastSeen = time.Now()
 	}
 }
@@ -178,36 +209,34 @@ func (pr *PeerRegistry) GetPeers() map[netip.AddrPort]*PeerRegistryInfo {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
 
-	result := make(map[netip.AddrPort]*PeerRegistryInfo, len(pr.peers))
-	for addr, peer := range pr.peers {
+	result := make(map[netip.AddrPort]*PeerRegistryInfo, len(pr.peerRegistryInfos))
+	for addr, peer := range pr.peerRegistryInfos {
 		peerCopy := *peer
 		result[addr] = &peerCopy
 	}
 	return result
 }
 
-func (pr *PeerRegistry) GetConnectedPeers() []netip.AddrPort {
+func (pr *PeerRegistry) GetPeerInfo(addr netip.AddrPort) *PeerRegistryInfo {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
 
-	var connected []netip.AddrPort
-	for addr, peer := range pr.peers {
-		if peer.Status == PeerStatusConnected {
-			connected = append(connected, addr)
-		}
+	if peer, ok := pr.peerRegistryInfos[addr]; ok {
+		peerCopy := *peer
+		return &peerCopy
 	}
-	return connected
+	return nil
 }
 
-func (pr *PeerRegistry) GetPeersWithFile(checksum string) []netip.AddrPort {
+func (pr *PeerRegistry) GetPeersWithFile(checksum string) []protocol.PeerInfoSummary {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
 
-	var peers []netip.AddrPort
-	for addr, peer := range pr.peers {
+	var peers []protocol.PeerInfoSummary
+	for addr, peer := range pr.peerRegistryInfos {
 		for _, file := range peer.SharedFiles {
 			if file.Checksum == checksum {
-				peers = append(peers, addr)
+				peers = append(peers, pr.peerSummaries[addr])
 				break
 			}
 		}
@@ -219,8 +248,9 @@ func (pr *PeerRegistry) RemovePeer(addr netip.AddrPort) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	if _, ok := pr.peers[addr]; ok {
-		delete(pr.peers, addr)
+	if _, ok := pr.peerRegistryInfos[addr]; ok {
+		delete(pr.peerRegistryInfos, addr)
+		delete(pr.peerSummaries, addr)
 		pr.logger.Printf("Removed peer: %s", addr)
 	}
 }
@@ -281,7 +311,7 @@ func (pr *PeerRegistry) cleanupStaleConnections() {
 	now := time.Now()
 
 	var toRemove []netip.AddrPort
-	for addr, peer := range pr.peers {
+	for addr, peer := range pr.peerRegistryInfos {
 		timeSinceLastSeen := now.Sub(peer.LastSeen)
 
 		if timeSinceLastSeen > UNREACHABLE_PEER_THRESHOLD || peer.FailureCount > 3 {
@@ -292,7 +322,8 @@ func (pr *PeerRegistry) cleanupStaleConnections() {
 	}
 
 	for _, addr := range toRemove {
-		delete(pr.peers, addr)
+		delete(pr.peerRegistryInfos, addr)
+		delete(pr.peerSummaries, addr)
 	}
 
 	if len(toRemove) > 0 {

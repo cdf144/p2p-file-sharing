@@ -7,6 +7,8 @@ import {
     GetConnectedPeers,
     GetCurrentConfig,
     GetCurrentSharedFiles,
+    SelectCertificateFile,
+    SelectPrivateKeyFile,
     SelectShareDirectory,
     StartPeerLogic,
     StopPeerLogic,
@@ -28,6 +30,9 @@ const peerConfig = reactive({
     shareDir: '',
     servePort: 0,
     publicPort: 0,
+    tls: false,
+    certFile: '',
+    keyFile: '',
 });
 
 const peerState = reactive({
@@ -69,6 +74,42 @@ async function handleSelectDirectory() {
     }
 }
 
+async function handleSelectCertFile() {
+    try {
+        peerState.statusMessage = 'Selecting certificate file...';
+        const selectedFile = await SelectCertificateFile();
+        peerConfig.certFile = selectedFile;
+        updatePeerConfig({ ...peerConfig });
+
+        if (selectedFile) {
+            peerState.statusMessage = `Certificate file set to: ${selectedFile}. Configuration updated.`;
+        } else {
+            peerState.statusMessage = 'Certificate file selection cancelled. Configuration updated.';
+        }
+    } catch (error: any) {
+        peerState.statusMessage = `Error selecting certificate file: ${error.message || error}`;
+        LogError(`Error in handleSelectCertFile: ${error}`);
+    }
+}
+
+async function handleSelectKeyFile() {
+    try {
+        peerState.statusMessage = 'Selecting private key file...';
+        const selectedFile = await SelectPrivateKeyFile();
+        peerConfig.keyFile = selectedFile;
+        updatePeerConfig({ ...peerConfig });
+
+        if (selectedFile) {
+            peerState.statusMessage = `Private key file set to: ${selectedFile}. Configuration updated.`;
+        } else {
+            peerState.statusMessage = 'Private key file selection cancelled. Configuration updated.';
+        }
+    } catch (error: any) {
+        peerState.statusMessage = `Error selecting private key file: ${error.message || error}`;
+        LogError(`Error in handleSelectKeyFile: ${error}`);
+    }
+}
+
 async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
     peerState.isLoading = true;
 
@@ -92,15 +133,25 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
     // Start
     peerState.statusMessage = 'Starting peer...';
     try {
+        const effectiveTLS = configFromChild.tls && configFromChild.certFile !== '' && configFromChild.keyFile !== '';
+        if (configFromChild.tls && !effectiveTLS) {
+            throw new Error('TLS is enabled but certificate or private key file is missing');
+        }
         peerConfig.indexURL = configFromChild.indexURL;
         peerConfig.servePort = configFromChild.servePort;
         peerConfig.publicPort = configFromChild.publicPort;
+        peerConfig.tls = configFromChild.tls;
+        peerConfig.certFile = configFromChild.certFile;
+        peerConfig.keyFile = configFromChild.keyFile;
 
         await StartPeerLogic(
             peerConfig.indexURL,
             peerConfig.shareDir,
             Number(peerConfig.servePort),
             Number(peerConfig.publicPort),
+            effectiveTLS,
+            peerConfig.certFile,
+            peerConfig.keyFile,
         );
 
         peerState.statusMessage = 'Peer started successfully.';
@@ -117,11 +168,15 @@ async function handleToggleStartStopPeer(configFromChild: typeof peerConfig) {
 }
 
 function updatePeerConfig(newConfig: typeof peerConfig) {
+    const effectiveTLS = newConfig.tls && newConfig.certFile !== '' && newConfig.keyFile !== '';
     UpdatePeerConfig(
         newConfig.indexURL,
         newConfig.shareDir,
         Number(newConfig.servePort),
         Number(newConfig.publicPort),
+        effectiveTLS,
+        newConfig.certFile,
+        newConfig.keyFile,
     ).catch((error: any) => {
         LogError(`Error updating peer config: ${error}`);
     });
@@ -149,8 +204,8 @@ async function queryNetwork() {
 async function downloadFile(file: protocol.FileMeta) {
     try {
         peerState.statusMessage = `Fetching peers for ${file.name}...`;
-        const peers = await FetchPeersForFile(file.checksum);
 
+        const peers = await FetchPeersForFile(file.checksum);
         if (!peers || peers.length === 0) {
             const errorMessage = `No peers found for file ${file.name} (checksum: ${file.checksum}).`;
             peerState.statusMessage = errorMessage;
@@ -217,6 +272,9 @@ onMounted(async () => {
         peerConfig.shareDir = initialConfig.ShareDir;
         peerConfig.servePort = initialConfig.ServePort;
         peerConfig.publicPort = initialConfig.PublicPort;
+        peerConfig.tls = initialConfig.tls || false;
+        peerConfig.certFile = initialConfig.certFile || '';
+        peerConfig.keyFile = initialConfig.keyFile || '';
 
         const initialFiles = await GetCurrentSharedFiles();
         peerState.sharedFiles = initialFiles || [];
@@ -237,6 +295,9 @@ onMounted(async () => {
         peerConfig.shareDir = config.ShareDir;
         peerConfig.servePort = config.ServePort;
         peerConfig.publicPort = config.PublicPort;
+        peerConfig.tls = config.tls || false;
+        peerConfig.certFile = config.certFile || '';
+        peerConfig.keyFile = config.keyFile || '';
     });
     unsubscribeDownloadProgress = EventsOn('downloadProgress', (progress: main.DownloadProgressEvent) => {
         if (progress && progress.fileChecksum) {
@@ -283,8 +344,10 @@ onUnmounted(() => {
         :peerConfig="peerConfig"
         :is-serving="peerState.isServing"
         :is-loading="peerState.isLoading"
-        @update:config="updatePeerConfig"
+        @update-config="updatePeerConfig"
         @select-directory="handleSelectDirectory"
+        @select-cert-file="handleSelectCertFile"
+        @select-key-file="handleSelectKeyFile"
         @toggle-start-stop-peer="handleToggleStartStopPeer"
     />
 
