@@ -294,7 +294,7 @@ func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 		p.logger.Printf("De-announced from old index URL: %s", oldIndexURL)
 	}
 
-	p.indexClient = NewIndexClient(newIndexURL, p.logger)
+	p.indexClient.SetIndexURL(newIndexURL)
 	p.logger.Printf("IndexClient updated with new URL: %s", newIndexURL)
 
 	if p.isServing && newIndexURL != "" {

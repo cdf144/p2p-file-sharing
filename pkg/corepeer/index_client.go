@@ -271,3 +271,12 @@ func (ic *IndexClient) QueryFilePeers(ctx context.Context, checksum string) ([]n
 	ic.logger.Printf("Found %d peers for file with checksum %s", len(peerAddrs), checksum)
 	return peerAddrs, nil
 }
+
+func (ic *IndexClient) SetIndexURL(indexURL string) {
+	if indexURL == "" {
+		ic.logger.Println("Index URL is empty, not setting.")
+		return
+	}
+	ic.indexURL = indexURL
+	ic.logger.Printf("Index URL set to: %s", indexURL)
+}
