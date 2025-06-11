@@ -19,9 +19,9 @@ function discoverPeers() {
 </script>
 
 <template>
-    <div class="space-y-4 rounded-lg bg-gray-700 p-6 shadow-lg">
-        <div class="flex items-center justify-between">
-            <h2 class="text-xl font-semibold">Network Discovery</h2>
+    <div class="rounded-lg bg-gray-700 p-4 shadow">
+        <div class="mb-4 flex items-center justify-between">
+            <h3 class="text-lg font-semibold">Network Discovery</h3>
             <button
                 @click="discoverPeers"
                 class="focus:ring-opacity-50 rounded-md bg-purple-600 px-4 py-2 font-semibold text-white shadow hover:bg-purple-700 focus:ring-2 focus:ring-purple-500 focus:outline-none disabled:opacity-50"

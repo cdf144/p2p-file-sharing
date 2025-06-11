@@ -41,7 +41,7 @@ const handleRefresh = () => {
             <button
                 @click="handleRefresh"
                 :disabled="isLoading"
-                class="rounded bg-blue-600 px-3 py-1 text-sm transition-colors duration-200 hover:bg-blue-700 disabled:bg-blue-500 disabled:opacity-50"
+                class="text-md rounded-md bg-blue-600 px-4 py-2 font-semibold transition-colors duration-200 hover:bg-blue-700 disabled:bg-blue-500 disabled:opacity-50"
             >
                 Refresh
             </button>

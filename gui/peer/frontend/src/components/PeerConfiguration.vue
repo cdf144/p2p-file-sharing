@@ -63,26 +63,25 @@ function toggleStartStopPeer() {
                 :disabled="isLoading"
             />
         </div>
-
-        <div class="flex items-end space-x-2">
-            <div class="flex-grow">
-                <label for="shareDir" class="block text-sm font-medium text-gray-300">Share Directory:</label>
+        <div class="space-y-2">
+            <label for="shareDir" class="block text-sm font-medium text-gray-300">Share Directory:</label>
+            <div class="flex items-center space-x-2">
                 <input
                     id="shareDir"
                     :value="props.peerConfig.shareDir"
                     type="text"
                     readonly
-                    class="mt-1 block w-full cursor-not-allowed rounded-md border-gray-500 bg-gray-500 px-3 py-2 shadow-sm sm:text-sm"
+                    class="block h-10 w-full cursor-not-allowed rounded-md border-gray-500 bg-gray-500 px-3 py-2 shadow-sm sm:text-sm"
                     placeholder="Click 'Select Directory' button"
                 />
+                <button
+                    @click="selectDirectory"
+                    class="focus:ring-opacity-50 text-md h-10 rounded-md bg-blue-600 px-3 py-2 font-semibold whitespace-nowrap text-white shadow hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:opacity-50"
+                    :disabled="isLoading"
+                >
+                    Select Directory
+                </button>
             </div>
-            <button
-                @click="selectDirectory"
-                class="focus:ring-opacity-50 rounded-md bg-blue-600 px-4 py-2 font-semibold text-white shadow hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:opacity-50"
-                :disabled="isLoading"
-            >
-                Select Directory
-            </button>
         </div>
 
         <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
