@@ -1,16 +1,12 @@
 package corepeer
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/netip"
-	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,19 +36,19 @@ type CorePeerConfig struct {
 
 // CorePeer manages the core P2P logic.
 type CorePeer struct {
-	config          CorePeerConfig
-	rootCtx         context.Context // Root context for the peer's lifetime, from Start()
-	listener        net.Listener
-	isServing       bool
-	serveCtx        context.Context    // Own context for managing internal serving lifecycle
-	serveCancel     context.CancelFunc // Function to cancel serveCtx
-	sharedFiles     []protocol.FileMeta
-	sharedFilePaths map[string]string // map[checksum]fullFilePath for quick local lookups
-	announcedAddr   netip.AddrPort
-	mu              sync.RWMutex
-	logger          *log.Logger
-	indexClient     *IndexClient
-	downloadManager *DownloadManager
+	config            CorePeerConfig
+	rootCtx           context.Context // Root context for the peer's lifetime, from Start()
+	listener          net.Listener
+	isServing         bool
+	serveCtx          context.Context    // Own context for managing internal serving lifecycle
+	serveCancel       context.CancelFunc // Function to cancel serveCtx
+	announcedAddr     netip.AddrPort
+	mu                sync.RWMutex
+	logger            *log.Logger
+	fileManager       *FileManager
+	indexClient       *IndexClient
+	downloadManager   *DownloadManager
+	connectionHandler *ConnectionHandler
 }
 
 // chunkDownloadResult represents the result of a goroutine worker downloading a single chunk of data.
@@ -66,11 +62,11 @@ type chunkDownloadResult struct {
 // NewCorePeer creates a new CorePeer instance.
 func NewCorePeer(cfg CorePeerConfig) *CorePeer {
 	logger := log.New(log.Writer(), "[corepeer] ", log.LstdFlags|log.Lmsgprefix)
-	p := &CorePeer{
-		logger:      logger,
-		indexClient: NewIndexClient(cfg.IndexURL, logger),
-	}
+	p := &CorePeer{logger: logger}
+	p.fileManager = NewFileManager(logger)
+	p.indexClient = NewIndexClient(cfg.IndexURL, logger)
 	p.downloadManager = NewDownloadManager(logger, p.indexClient)
+	p.connectionHandler = NewConnectionHandler(logger, p.fileManager)
 	p.UpdateConfig(context.Background(), cfg)
 	return p
 }
@@ -116,7 +112,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	p.logger.Printf("Announcing with port: %d", announcePort)
 
 	p.announcedAddr = netip.AddrPortFrom(announceIP, announcePort)
-	if err := p.indexClient.Announce(p.announcedAddr, p.sharedFiles); err != nil {
+	if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
 		if p.listener != nil {
 			p.listener.Close()
 			p.listener = nil
@@ -130,7 +126,7 @@ func (p *CorePeer) Start(ctx context.Context) (string, error) {
 	p.isServing = true
 	statusMsg := fmt.Sprintf(
 		"Peer started. Sharing from: %s. IP: %s, Serving Port: %d, Announced Port: %d. Files shared: %d",
-		p.config.ShareDir, p.announcedAddr.Addr(), p.config.ServePort, p.announcedAddr.Port(), len(p.sharedFiles),
+		p.config.ShareDir, p.announcedAddr.Addr(), p.config.ServePort, p.announcedAddr.Port(), len(p.fileManager.GetSharedFiles()),
 	)
 	p.logger.Println(statusMsg)
 	return statusMsg, nil
@@ -223,11 +219,7 @@ func (p *CorePeer) IsServing() bool {
 
 // GetSharedFiles returns a copy of the currently shared files.
 func (p *CorePeer) GetSharedFiles() []protocol.FileMeta {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	filesCopy := make([]protocol.FileMeta, len(p.sharedFiles))
-	copy(filesCopy, p.sharedFiles)
-	return filesCopy
+	return p.fileManager.GetSharedFiles()
 }
 
 // FetchFilesFromIndex retrieves all available file metadata from the index server.
@@ -281,251 +273,7 @@ func (p *CorePeer) acceptConnections(ctx context.Context) {
 }
 
 func (p *CorePeer) handleConnection(conn net.Conn) {
-	defer conn.Close()
-	p.logger.Printf("Handling new persistent connection from %s", conn.RemoteAddr().String())
-
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
-
-	for {
-		if err := conn.SetReadDeadline(time.Now().Add(persistentConnectionIdleTimeout)); err != nil {
-			p.logger.Printf("Error setting read deadline for %s: %v. Closing session.", conn.RemoteAddr(), err)
-			return
-		}
-
-		msgTypeByte, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				p.logger.Printf("Connection closed by client %s (EOF while reading msg type). Ending session.", conn.RemoteAddr())
-			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				p.logger.Printf(
-					"Connection from %s timed out waiting for message type (idle_timeout: %s). Ending session.",
-					conn.RemoteAddr(), persistentConnectionIdleTimeout,
-				)
-			} else {
-				p.logger.Printf("Failed to read message type from %s: %v. Ending session.", conn.RemoteAddr(), err)
-			}
-			return
-		}
-
-		if err := conn.SetReadDeadline(time.Now().Add(activeRequestProcessingTimeout)); err != nil {
-			p.logger.Printf("Error setting active request read deadline for %s: %v. Closing session.", conn.RemoteAddr(), err)
-			return
-		}
-
-		msgType := protocol.MessageType(msgTypeByte)
-		p.logger.Printf("Received message type %s (%d) from %s on persistent connection", msgType.String(), msgTypeByte, conn.RemoteAddr())
-
-		var requestHandledSuccessfully bool
-		switch msgType {
-		case protocol.CHUNK_REQUEST:
-			p.handleChunkRequestCommand(conn, reader, writer)
-			requestHandledSuccessfully = true
-		case protocol.FILE_REQUEST:
-			p.handleFileRequestCommand(conn, reader, writer)
-			requestHandledSuccessfully = true
-		default:
-			p.logger.Printf("Warning: Received unknown message type %d from %s on persistent connection", msgTypeByte, conn.RemoteAddr())
-			p.sendError(writer, conn.RemoteAddr().String(), "Unknown message type")
-			p.logger.Printf("Terminating session with %s due to unknown message type.", conn.RemoteAddr())
-			return
-		}
-
-		if !requestHandledSuccessfully {
-			p.logger.Printf("Request handler indicated an issue, terminating session with %s.", conn.RemoteAddr())
-			return
-		}
-	}
-}
-
-// handleChunkRequestCommand processes a CHUNK_REQUEST message.
-func (p *CorePeer) handleChunkRequestCommand(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) {
-	fileChecksum, err := reader.ReadString('\n')
-	if err != nil {
-		p.logger.Printf("Warning: Failed to read file checksum for CHUNK_REQUEST from %s: %v", conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read file checksum")
-		return
-	}
-	fileChecksum = strings.TrimSpace(fileChecksum)
-
-	chunkIndexStr, err := reader.ReadString('\n')
-	if err != nil {
-		p.logger.Printf("Warning: Failed to read chunk index for CHUNK_REQUEST from %s: %v", conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read chunk index")
-		return
-	}
-	chunkIndexStr = strings.TrimSpace(chunkIndexStr)
-	chunkIndex, err := strconv.Atoi(chunkIndexStr)
-	if err != nil {
-		p.logger.Printf("Warning: Invalid chunk index '%s' for CHUNK_REQUEST from %s: %v", chunkIndexStr, conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Invalid chunk index format")
-		return
-	}
-
-	fileMeta, err := p.getSharedFileMetaByChecksum(fileChecksum)
-	if err != nil {
-		p.logger.Printf("Warning: FileMeta not found for checksum %s (CHUNK_REQUEST by %s): %v", fileChecksum, conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), fmt.Sprintf("File not found for checksum %s", fileChecksum))
-		return
-	}
-
-	if chunkIndex < 0 || (fileMeta.NumChunks > 0 && chunkIndex >= fileMeta.NumChunks) || (fileMeta.NumChunks == 0 && chunkIndex != 0) {
-		errMsg := fmt.Sprintf("Invalid chunk index %d for file %s (NumChunks: %d)", chunkIndex, fileMeta.Name, fileMeta.NumChunks)
-		p.logger.Printf("Warning: %s, requested by %s", errMsg, conn.RemoteAddr())
-		p.sendError(writer, conn.RemoteAddr().String(), errMsg)
-		return
-	}
-	if fileMeta.NumChunks == 0 { // Also implies fileMeta.Size == 0
-		errMsg := fmt.Sprintf("File %s is empty, no chunks to request (NumChunks: 0)", fileMeta.Name)
-		p.logger.Printf("Warning: %s, requested by %s", errMsg, conn.RemoteAddr())
-		p.sendError(writer, conn.RemoteAddr().String(), errMsg)
-		return
-	}
-
-	p.mu.RLock()
-	filePath := p.sharedFilePaths[fileChecksum]
-	p.mu.RUnlock()
-	if filePath == "" {
-		p.logger.Printf("Critical: File path for checksum %s is empty despite FileMeta existing. CHUNK_REQUEST by %s", fileChecksum, conn.RemoteAddr())
-		p.sendError(writer, conn.RemoteAddr().String(), "Internal server error: file path missing")
-		return
-	}
-
-	fileHandle, err := os.Open(filePath)
-	if err != nil {
-		p.logger.Printf("Warning: Failed to open file %s for CHUNK_REQUEST by %s: %v", filePath, conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Failed to open file for chunk")
-		return
-	}
-	defer fileHandle.Close()
-
-	chunkOffset := int64(chunkIndex) * fileMeta.ChunkSize
-	bytesToRead := fileMeta.ChunkSize
-	if chunkIndex == fileMeta.NumChunks-1 {
-		if remainder := fileMeta.Size % fileMeta.ChunkSize; remainder != 0 {
-			bytesToRead = remainder
-		}
-	}
-
-	chunkData := make([]byte, bytesToRead)
-	if _, err = fileHandle.Seek(chunkOffset, io.SeekStart); err != nil {
-		p.logger.Printf("Warning: Failed to seek to chunk offset %d for file %s (CHUNK_REQUEST by %s): %v", chunkOffset, filePath, conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Failed to seek to chunk")
-		return
-	}
-
-	n, err := io.ReadFull(fileHandle, chunkData)
-	if err != nil {
-		p.logger.Printf("Warning: Failed to read chunk %d from file %s (expected %d bytes, got %d) for %s: %v", chunkIndex, filePath, bytesToRead, n, conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read chunk data")
-		return
-	}
-	actualChunkData := chunkData[:n]
-
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Minute))
-
-	if _, err := writer.Write([]byte{byte(protocol.CHUNK_DATA)}); err != nil {
-		p.logger.Printf("Warning: Failed to write CHUNK_DATA message type to buffer for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	if _, err := writer.WriteString(fileChecksum + "\n"); err != nil {
-		p.logger.Printf("Warning: Failed to write file checksum to buffer for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	if _, err := writer.WriteString(strconv.Itoa(chunkIndex) + "\n"); err != nil {
-		p.logger.Printf("Warning: Failed to write chunk index to buffer for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	if _, err := writer.WriteString(fmt.Sprintf("%d\n", int64(n))); err != nil {
-		p.logger.Printf("Warning: Failed to write chunk length to buffer for %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	if _, err := writer.Write(actualChunkData); err != nil {
-		p.logger.Printf(
-			"Warning: Failed to write chunk %d payload for file %s to buffer for %s: %v",
-			chunkIndex, fileMeta.Name, conn.RemoteAddr(), err,
-		)
-		return
-	}
-
-	if err := writer.Flush(); err != nil {
-		p.logger.Printf(
-			"Warning: Failed to flush CHUNK_DATA message for file %s chunk %d to %s: %v",
-			fileMeta.Name, chunkIndex, conn.RemoteAddr(), err,
-		)
-		return
-	}
-
-	p.logger.Printf(
-		"Successfully sent chunk %d (%d bytes) for file %s (%s) to %s",
-		chunkIndex, n, fileMeta.Name, fileChecksum, conn.RemoteAddr(),
-	)
-}
-
-// handleFileRequestCommand processes a FILE_REQUEST message.
-func (p *CorePeer) handleFileRequestCommand(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) {
-	checksum, err := reader.ReadString('\n')
-	if err != nil {
-		p.logger.Printf("Warning: Failed to read checksum for FILE_REQUEST from %s: %v", conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), "Failed to read checksum")
-		return
-	}
-	checksum = strings.TrimSpace(checksum)
-
-	localFile, err := p.getLocalFileInfoByChecksum(checksum)
-	if err != nil {
-		p.logger.Printf("Warning: File not found for checksum %s (FILE_REQUEST by %s): %v", checksum, conn.RemoteAddr(), err)
-		p.sendError(writer, conn.RemoteAddr().String(), fmt.Sprintf("File not found for checksum %s", checksum))
-		return
-	}
-
-	if _, err := writer.Write([]byte{byte(protocol.FILE_DATA)}); err != nil {
-		p.logger.Printf("Warning: Failed to write FILE_DATA message type to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
-		return
-	}
-	if _, err := writer.WriteString(fmt.Sprintf("%d\n", localFile.Size)); err != nil {
-		p.logger.Printf("Warning: Failed to write file size to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
-		return
-	}
-	if err := writer.Flush(); err != nil {
-		p.logger.Printf("Warning: Failed to flush FILE_DATA header to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
-		return
-	}
-
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
-
-	fileHandle, err := os.Open(localFile.Path)
-	if err != nil {
-		p.logger.Printf("Warning: Failed to open file %s for FILE_REQUEST by %s: %v", localFile.Path, conn.RemoteAddr(), err)
-		return
-	}
-	defer fileHandle.Close()
-
-	sent, err := io.Copy(conn, fileHandle)
-	if err != nil {
-		p.logger.Printf("Warning: Failed to send file %s to %s: %v", localFile.Name, conn.RemoteAddr(), err)
-		return
-	}
-	if sent != localFile.Size {
-		p.logger.Printf("Warning: Incomplete file transfer for %s to %s: sent %d, expected %d", localFile.Name, conn.RemoteAddr(), sent, localFile.Size)
-		return
-	}
-
-	p.logger.Printf("Successfully sent file %s (%d bytes) to %s via FILE_REQUEST", localFile.Name, sent, conn.RemoteAddr())
-}
-
-func (p *CorePeer) sendError(writer *bufio.Writer, remoteAddr string, errorMessage string) {
-	if _, err := writer.Write([]byte{byte(protocol.ERROR)}); err != nil {
-		p.logger.Printf("Warning: Failed to write ERROR message type to %s: %v", remoteAddr, err)
-		return
-	}
-	if _, err := writer.WriteString(errorMessage + "\n"); err != nil {
-		p.logger.Printf("Warning: Failed to write error message string to %s: %v", remoteAddr, err)
-		return
-	}
-	if err := writer.Flush(); err != nil {
-		p.logger.Printf("Warning: Failed to flush error message to %s: %v", remoteAddr, err)
-	}
+	p.connectionHandler.HandleConnection(conn)
 }
 
 // handleIndexURLChange manages the transition from an old index URL to a new one.
@@ -550,7 +298,7 @@ func (p *CorePeer) handleIndexURLChange(oldIndexURL, newIndexURL string) error {
 	p.logger.Printf("IndexClient updated with new URL: %s", newIndexURL)
 
 	if p.isServing && newIndexURL != "" {
-		if err := p.indexClient.Announce(p.announcedAddr, p.sharedFiles); err != nil {
+		if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
 			return fmt.Errorf("failed to re-announce to new index URL %s: %w", newIndexURL, err)
 		}
 	}
@@ -580,14 +328,14 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 	}
 
 	p.logger.Printf("Share directory changing from '%s' to '%s'", oldShareDir, newAbsShareDir)
-	p.resetSharedFiles()
+	p.fileManager.Reset()
 	p.config.ShareDir = newAbsShareDir
 
 	wasPreviouslySharingFromDir := oldShareDir != ""
 	willNowShareFromDir := newAbsShareDir != ""
 
 	if willNowShareFromDir {
-		if err := p.scanAndUpdateSharedFiles(ctx); err != nil {
+		if err := p.fileManager.UpdateShareDir(ctx, newAbsShareDir); err != nil {
 			p.logger.Printf("Warning: Failed to scan share directory %s: %v. Shared files will be empty.", newAbsShareDir, err)
 		}
 	} else {
@@ -599,7 +347,7 @@ func (p *CorePeer) handleShareDirChange(ctx context.Context, oldShareDir, newSha
 			p.config.ShareDir = oldShareDir
 			return err
 		}
-		if err := p.indexClient.Reannounce(p.announcedAddr, p.sharedFiles); err != nil {
+		if err := p.indexClient.Reannounce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
 			p.logger.Printf("Warning: Failed to re-announce after share directory update: %v", err)
 		}
 	}
@@ -665,7 +413,7 @@ func (p *CorePeer) handlePublicPortChange(oldPublicPort, newPublicPort int) erro
 	p.logger.Printf("De-announced from index server due to public port change from %d to %d", oldPublicPort, newPublicPort)
 
 	p.announcedAddr = netip.AddrPortFrom(p.announcedAddr.Addr(), uint16(newPublicPort))
-	if err := p.indexClient.Announce(p.announcedAddr, p.sharedFiles); err != nil {
+	if err := p.indexClient.Announce(p.announcedAddr, p.fileManager.GetSharedFiles()); err != nil {
 		return fmt.Errorf("failed to re-announce to index server with new public port %d: %w", newPublicPort, err)
 	}
 	p.logger.Printf("Re-announced to index server with new public port: %d", newPublicPort)
@@ -735,30 +483,6 @@ func (p *CorePeer) updateTCPServerState(shouldBeRunning, wasRunning bool) error 
 	return nil
 }
 
-// resetSharedFiles clears the shared files state
-func (p *CorePeer) resetSharedFiles() {
-	p.sharedFiles = []protocol.FileMeta{}
-	p.sharedFilePaths = make(map[string]string)
-}
-
-// scanAndUpdateSharedFiles scans the current share directory and updates shared files
-func (p *CorePeer) scanAndUpdateSharedFiles(ctx context.Context) error {
-	if p.config.ShareDir == "" {
-		return nil
-	}
-
-	p.logger.Printf("Scanning directory: %s", p.config.ShareDir)
-	scannedFiles, scannedPaths, err := ScanDirectory(ctx, p.config.ShareDir, p.logger)
-	if err != nil {
-		return err
-	}
-
-	p.sharedFiles = scannedFiles
-	p.sharedFilePaths = scannedPaths
-	p.logger.Printf("Scanned %d files from %s", len(p.sharedFiles), p.config.ShareDir)
-	return nil
-}
-
 // processServerPortConfig validates and configures the server port for the CorePeer.
 // It accepts a port number and returns the actual port to be used along with any error.
 func (p *CorePeer) processServerPortConfig(port int) (int, error) {
@@ -784,45 +508,4 @@ func (p *CorePeer) processServerPortConfig(port int) (int, error) {
 	}
 
 	return port, nil
-}
-
-// getLocalFileInfoByChecksum retrieves local file information for a file identified by its checksum.
-func (p *CorePeer) getLocalFileInfoByChecksum(checksum string) (*LocalFileInfo, error) {
-	p.mu.RLock()
-	filePath, ok := p.sharedFilePaths[checksum]
-	p.mu.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("file with checksum %s not found in shared files index", checksum)
-	}
-
-	info, err := os.Stat(filePath)
-	if err != nil {
-		p.logger.Printf("Warning: Error stating file %s (checksum %s): %v. File might be missing.", filePath, checksum, err)
-		// NOTE: Trigger a re-scan (or remove from index) here or not?
-		return nil, fmt.Errorf("file path %s (checksum %s) found in index but failed to stat: %w", filePath, checksum, err)
-	}
-
-	return &LocalFileInfo{
-		Checksum: checksum,
-		Path:     filePath,
-		Name:     info.Name(),
-		Size:     info.Size(),
-	}, nil
-}
-
-func (p *CorePeer) getSharedFileMetaByChecksum(checksum string) (protocol.FileMeta, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if _, ok := p.sharedFilePaths[checksum]; !ok {
-		return protocol.FileMeta{}, fmt.Errorf("file with checksum %s not found in shared file paths", checksum)
-	}
-
-	for _, fm := range p.sharedFiles {
-		if fm.Checksum == checksum {
-			return fm, nil
-		}
-	}
-	return protocol.FileMeta{}, fmt.Errorf("file metadata for checksum %s not found in shared files list (inconsistent state)", checksum)
 }
