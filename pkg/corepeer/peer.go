@@ -8,21 +8,11 @@ import (
 	"net/netip"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
 )
 
-const (
-	maxConcurrentDownloadsPerFile   = 5
-	maxRetriesPerChunk              = 2
-	chunkDownloadTimeout            = 60 * time.Second
-	peerConnectTimeout              = 10 * time.Second
-	persistentConnectionIdleTimeout = 2 * time.Minute
-	activeRequestProcessingTimeout  = 90 * time.Second
-)
-
-// TODO: Implement downloading files in chunks from multiple peers, with progress reporting and connections tracking.
+// TODO: Implement progress reporting and connections tracking.
 // TODO: Implement optional secure connections (TLS) for file transfers.
 
 // CorePeerConfig holds configuration for the CorePeer.

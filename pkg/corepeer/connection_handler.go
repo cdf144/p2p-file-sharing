@@ -14,6 +14,11 @@ import (
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
 )
 
+const (
+	persistentConnectionIdleTimeout = 2 * time.Minute
+	activeRequestProcessingTimeout  = 90 * time.Second
+)
+
 type ConnectionHandler struct {
 	logger      *log.Logger
 	fileManager *FileManager

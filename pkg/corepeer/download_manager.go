@@ -20,6 +20,13 @@ import (
 	"github.com/cdf144/p2p-file-sharing/pkg/protocol"
 )
 
+const (
+	maxConcurrentDownloadsPerFile = 6
+	maxRetriesPerChunk            = 2
+	chunkDownloadTimeout          = 30 * time.Second
+	peerConnectTimeout            = 10 * time.Second
+)
+
 type DownloadManager struct {
 	logger      *log.Logger
 	indexClient *IndexClient
