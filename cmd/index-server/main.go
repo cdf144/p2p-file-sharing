@@ -29,7 +29,7 @@ var httpServerPort int
 func main() {
 	flag.IntVar(&httpServerPort, "port", 9090, "Port to run the index server on")
 	flag.Parse()
-	if !(0 < httpServerPort && httpServerPort <= 65535) {
+	if httpServerPort < 1 || httpServerPort > 65535 {
 		log.Fatalf("Invalid port number: %d. Must be between 1 and 65535.", httpServerPort)
 	}
 

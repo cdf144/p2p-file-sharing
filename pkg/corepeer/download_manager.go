@@ -557,7 +557,7 @@ func (dm *DownloadManager) runPeerDownloadSession(
 			}
 		}
 		if chunkLength < 0 || chunkLength > fileMeta.ChunkSize || chunkLength != expectedChunkSize {
-			if !(chunkLength == 0 && expectedChunkSize == 0) { // Allow 0-length for 0-expected
+			if chunkLength != 0 || expectedChunkSize != 0 {
 				chunkErr = fmt.Errorf(
 					"invalid chunk data length %d (expected %d, max %d) from peer %s",
 					chunkLength, expectedChunkSize, fileMeta.ChunkSize, peerAddr,

@@ -1,6 +1,6 @@
 module github.com/cdf144/p2p-file-sharing
 
-go 1.24.3
+go 1.24
 
 require github.com/wailsapp/wails/v2 v2.10.1
 

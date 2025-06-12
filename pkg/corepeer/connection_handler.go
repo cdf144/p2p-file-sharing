@@ -198,15 +198,15 @@ func (c *ConnectionHandler) handleChunkRequestCommand(conn net.Conn, reader *buf
 		c.logger.Printf("Warning: Failed to write CHUNK_DATA message type to buffer for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
-	if _, err := writer.WriteString(fileChecksum + "\n"); err != nil {
+	if _, err := fmt.Fprintf(writer, "%s\n", fileChecksum); err != nil {
 		c.logger.Printf("Warning: Failed to write file checksum to buffer for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
-	if _, err := writer.WriteString(strconv.Itoa(chunkIndex) + "\n"); err != nil {
+	if _, err := fmt.Fprintf(writer, "%d\n", chunkIndex); err != nil {
 		c.logger.Printf("Warning: Failed to write chunk index to buffer for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
-	if _, err := writer.WriteString(fmt.Sprintf("%d\n", int64(n))); err != nil {
+	if _, err := fmt.Fprintf(writer, "%d\n", int64(n)); err != nil {
 		c.logger.Printf("Warning: Failed to write chunk length to buffer for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
@@ -259,7 +259,7 @@ func (c *ConnectionHandler) handleFileRequestCommand(conn net.Conn, reader *bufi
 		c.logger.Printf("Warning: Failed to write FILE_DATA message type to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
 		return
 	}
-	if _, err := writer.WriteString(fmt.Sprintf("%d\n", localFile.Size)); err != nil {
+	if _, err := fmt.Fprintf(writer, "%d\n", localFile.Size); err != nil {
 		c.logger.Printf("Warning: Failed to write file size to %s for %s: %v", conn.RemoteAddr(), localFile.Name, err)
 		return
 	}
