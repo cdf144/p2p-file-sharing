@@ -69,7 +69,11 @@ func (mt MessageType) String() string {
 }
 
 // GenerateChecksum computes the SHA256 checksum from an io.Reader.
+// If the reader is nil, it returns an io.ErrUnexpectedEOF error.
 func GenerateChecksum(r io.Reader) (string, error) {
+	if r == nil {
+		return "", io.ErrUnexpectedEOF
+	}
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, r); err != nil {
 		return "", err
