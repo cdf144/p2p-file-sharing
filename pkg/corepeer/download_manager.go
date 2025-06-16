@@ -367,6 +367,7 @@ func (dm *DownloadManager) runPeerDownloadSession(
 			fileMeta.Name, peerAddr, err,
 		)
 		dm.peerRegistry.UpdatePeerStatus(peerAddr, PeerStatusUnreachable)
+		results <- chunkDownloadResult{index: -1, peer: peerAddr, err: fmt.Errorf("failed to connect to peer %s: %w", peerAddr, err)}
 		return
 	}
 
