@@ -37,3 +37,6 @@ node_modules
 
 # Wails
 **/build/bin
+
+# Generated TLS certificates
+certs

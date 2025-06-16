@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -18,6 +19,9 @@ var (
 	shareDirFlag   string
 	servePortFlag  int
 	publicPortFlag int
+	tlsFlag        bool
+	certFileFlag   string
+	keyFileFlag    string
 )
 
 var (
@@ -33,6 +37,10 @@ func main() {
 	flag.IntVar(&servePortFlag, "servePort", 0, "Port to serve files on (0 for random)")
 	flag.IntVar(&publicPortFlag, "publicPort", 0, "Public port to announce (0 to use servePort)")
 
+	flag.BoolVar(&tlsFlag, "tls", false, "Enable TLS for secure connections")
+	flag.StringVar(&certFileFlag, "cert", "", "Path to TLS certificate file (required if -tls is enabled)")
+	flag.StringVar(&keyFileFlag, "key", "", "Path to TLS private key file (required if -tls is enabled)")
+
 	flag.StringVar(&checksumFlag, "checksum", "", "Checksum of the file to download (for 'download' command)")
 	flag.StringVar(&outputFlag, "output", "", "Path to save the downloaded file (for 'download' command, default: current dir with original filename)")
 
@@ -46,11 +54,24 @@ func main() {
 
 	command := flag.Arg(0)
 
+	if tlsFlag {
+		if certFileFlag == "" || keyFileFlag == "" {
+			log.Fatal("Error: Both -cert and -key are required when -tls is enabled.")
+		}
+		if _, err := tls.LoadX509KeyPair(certFileFlag, keyFileFlag); err != nil {
+			log.Fatalf("Error: Failed to load TLS certificate pair: %v", err)
+		}
+		log.Printf("TLS enabled with cert: %s, key: %s", certFileFlag, keyFileFlag)
+	}
+
 	cfg := corepeer.CorePeerConfig{
 		IndexURL:   indexURLFlag,
 		ShareDir:   shareDirFlag,
 		ServePort:  servePortFlag,
 		PublicPort: publicPortFlag,
+		TLS:        tlsFlag,
+		CertFile:   certFileFlag,
+		KeyFile:    keyFileFlag,
 	}
 
 	corePeer := corepeer.NewCorePeer(cfg)
@@ -64,6 +85,9 @@ func main() {
 		}
 
 		log.Println("Starting peer...")
+		if tlsFlag {
+			log.Println("TLS encryption enabled for incoming connections.")
+		}
 		statusMsg, err := corePeer.Start(ctx)
 		if err != nil {
 			log.Fatalf("Error starting peer: %v", err)
@@ -170,8 +194,17 @@ func printUsageAndExit() {
 	fmt.Fprintln(os.Stderr, "  download       Download a file from the network.")
 	fmt.Fprintln(os.Stderr, "                 Requires -indexURL and -checksum.")
 	fmt.Fprintln(os.Stderr, "                 Use -output to specify save location (file path or directory).")
+	fmt.Fprintln(os.Stderr, "\nTLS Options:")
+	fmt.Fprintln(os.Stderr, "  -tls           Enable TLS for secure connections")
+	fmt.Fprintln(os.Stderr, "  -cert <file>   Path to TLS certificate file (required with -tls)")
+	fmt.Fprintln(os.Stderr, "  -key <file>    Path to TLS private key file (required with -tls)")
 	fmt.Fprintln(os.Stderr, "\nExamples:")
 	fmt.Fprintf(os.Stderr, "  %s -shareDir /my/shared/files -servePort 8001 start\n", filepath.Base(os.Args[0]))
+	fmt.Fprintf(
+		os.Stderr,
+		"  %s -shareDir /my/shared/files -servePort 8001 -tls -cert server.crt -key server.key start\n",
+		filepath.Base(os.Args[0]),
+	)
 	fmt.Fprintf(os.Stderr, "  %s -indexURL http://localhost:9090 query-files\n", filepath.Base(os.Args[0]))
 	fmt.Fprintf(
 		os.Stderr,
