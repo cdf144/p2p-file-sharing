@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 )
 
 type TCPServer struct {
@@ -14,6 +15,7 @@ type TCPServer struct {
 	listener          net.Listener
 	serveCtx          context.Context
 	serveCancel       context.CancelFunc
+	tlsConfig         *tls.Config
 	connectionHandler *ConnectionHandler
 	fileManager       *FileManager
 }
@@ -55,15 +57,16 @@ func (ts *TCPServer) Start(ctx context.Context, port int, enableTLS bool, certFi
 		if errLoad != nil {
 			return fmt.Errorf("failed to load TLS key pair: %w", errLoad)
 		}
-		tlsConfig := &tls.Config{
+		ts.tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		l, err = tls.Listen("tcp", listenAddr, tlsConfig)
+		// Plain TCP listener, TLS will be handled per connection by upgradeToTLSIfNeeded
+		l, err = net.Listen("tcp", listenAddr)
 		if err != nil {
-			return fmt.Errorf("failed to listen with TLS on port %d: %w", port, err)
+			return fmt.Errorf("failed to listen on port %d: %w", port, err)
 		}
-		ts.logger.Printf("TCP server started with TLS on port: %d", port)
+		ts.logger.Printf("TCP server started with TLS support on port: %d", port)
 	} else {
 		l, err = net.Listen("tcp", listenAddr)
 		if err != nil {
@@ -140,7 +143,26 @@ func (ts *TCPServer) acceptConnections(ctx context.Context) {
 				return
 			}
 		}
+
+		if ts.tlsConfig != nil {
+			conn = ts.upgradeToTLSIfNeeded(conn)
+		}
+
 		ts.logger.Printf("Accepted connection from %s", conn.RemoteAddr().String())
 		go ts.connectionHandler.HandleConnection(conn)
 	}
+}
+
+func (ts *TCPServer) upgradeToTLSIfNeeded(conn net.Conn) net.Conn {
+	tlsConn := tls.Server(conn, ts.tlsConfig)
+	tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	if err := tlsConn.Handshake(); err != nil {
+		ts.logger.Printf("TLS handshake failed with %s, falling back to plain TCP: %v",
+			conn.RemoteAddr(), err)
+		return conn
+	}
+
+	tlsConn.SetReadDeadline(time.Time{})
+	return tlsConn
 }
