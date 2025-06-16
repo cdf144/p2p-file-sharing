@@ -218,7 +218,10 @@ func (s *IndexServer) upsertPeerAssociations(peerInfo protocol.PeerInfo) {
 		if _, ok := s.fileInfo[file.Checksum]; !ok {
 			s.fileInfo[file.Checksum] = file
 		}
-		s.files[file.Checksum] = append(s.files[file.Checksum], protocol.PeerInfo{Address: peerInfo.Address})
+		s.files[file.Checksum] = append(
+			s.files[file.Checksum],
+			protocol.PeerInfo{Address: peerInfo.Address, TLS: peerInfo.TLS},
+		)
 	}
 }
 
