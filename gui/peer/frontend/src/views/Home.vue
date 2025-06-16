@@ -225,8 +225,14 @@ async function downloadFile(file: protocol.FileMeta) {
 
         peerState.statusMessage = `Downloading ${file.name}...`;
         const result = await DownloadFileWithDialog(file.checksum, file.name);
+        if (result === 'Save cancelled by user.') {
+            delete downloadProgressMap[file.checksum];
+        }
         peerState.statusMessage = result;
     } catch (error: any) {
+        if (downloadProgressMap[file.checksum]) {
+            delete downloadProgressMap[file.checksum];
+        }
         LogError(`Error in download process for ${file.name}: ${error}`);
         peerState.statusMessage = `Error downloading file: ${error.message || error}`;
     }
